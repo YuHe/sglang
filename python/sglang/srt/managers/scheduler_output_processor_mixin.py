@@ -130,11 +130,15 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        # 【学习注释 ⑥-A】EXTEND（prefill）批次的结果处理
+        # prefill 结束 = 拿到每条请求的第 1 个输出 token
+        # 同时决定请求是否结束，并更新 RadixCache
         skip_stream_req = None
 
         if self.is_generation:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
+                # ↑ 等待 GPU→CPU 的异步 D2H copy 完成（overlap 场景）
             if result.routed_experts_output is not None:
                 result.routed_experts_output.finalize()
                 result.routed_experts_output = None
@@ -184,22 +188,28 @@ class SchedulerOutputProcessorMixin:
                 if req.finished() or req.is_retracted:
                     # decode req in mixed batch or retracted req
                     continue
+                    # ↑ MIXED 模式下批次里可能有 decode 请求，跳过（它们已在别处处理）
 
                 if req.is_chunked <= 0:
                     req.time_stats.set_prefill_finished_time()
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
+                    # ↑ 追加 prefill 产出的第 1 个 token
 
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
                     req.check_finished()
+                    # ↑ 检查停止条件：EOS token / max_new_tokens / stop_str
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
+                        # ↑ 请求已完成：解锁 RadixTree 节点，归还 KV Cache 物理页
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
+                        # ↑ 请求未完成（还要继续 decode）：
+                        #   把已计算的 KV 写入 RadixTree，供后续 match_prefix 命中
                         if self.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
@@ -394,8 +404,11 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        # 【学习注释 ⑥-B】DECODE 批次的结果处理
+        # 每条请求本轮各生成 1 个 token（投机解码时可能是多个）
         if result.copy_done is not None:
             result.copy_done.synchronize()
+            # ↑ 等待异步 D2H copy 完成
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None
@@ -441,6 +454,8 @@ class SchedulerOutputProcessorMixin:
             )
 
         self.token_to_kv_pool_allocator.free_group_begin()
+        # ↑ 开启批量释放模式：把本轮所有"需要释放的 KV 页"先积累起来
+        #   等 free_group_end() 时一次性释放，比逐条释放高效
 
         # Spec V1 handles output_ids, check_finished, grammar, and reasoning tokens
         # in the verify phase. Non-spec and V2 handle them here in post-processing.
@@ -473,9 +488,11 @@ class SchedulerOutputProcessorMixin:
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
+                # ↑ 普通 decode：追加这轮生成的 1 个 token
             else:
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
+                # ↑ 投机解码（Spec V2）：next_token_id 是 list，追加多个已验证 token
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
 
@@ -483,8 +500,10 @@ class SchedulerOutputProcessorMixin:
             self._mamba_prefix_cache_update(req, batch, result, i)
             req.time_stats.set_last_decode_finish_time()
             req.check_finished(new_accepted_len)
+            # ↑ 检查停止条件（EOS / max_tokens / stop_str）
 
             self._handle_finished_req(req, i, logits_output)
+            # ↑ 如果 req.finished()：release_kv_cache() → 解锁节点、归还 KV 物理页
 
             if req.return_logprob:
                 # Spec v1 handles logprobs inside its own worker.
@@ -543,7 +562,9 @@ class SchedulerOutputProcessorMixin:
                 req.grammar.finished = req.finished()
 
         self.stream_output(batch.reqs, batch.return_logprob)
+        # ↑ 打包本批次所有请求的输出，通过 ZMQ 发给 DetokenizerManager
         self.token_to_kv_pool_allocator.free_group_end()
+        # ↑ 真正执行本轮积累的 KV 物理页释放（批量操作，比逐条高效）
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
         self.report_decode_stats(
@@ -555,6 +576,7 @@ class SchedulerOutputProcessorMixin:
     def _handle_finished_req(
         self: Scheduler, req: Req, i: int, logits_output: LogitsProcessorOutput
     ):
+        # 【学习注释 ⑥-C】请求完成时的收尾：释放 KV Cache，记录完成时间
         if (
             self.server_args.disaggregation_decode_enable_offload_kvcache
             and not req.finished()
@@ -565,6 +587,7 @@ class SchedulerOutputProcessorMixin:
             # delete feature to save memory
             if req.multimodal_inputs is not None and req.session is None:
                 req.multimodal_inputs.release_features()
+                # ↑ 多模态：释放图像特征 tensor（占内存大）
             self.maybe_collect_routed_experts(req)
 
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
@@ -575,6 +598,10 @@ class SchedulerOutputProcessorMixin:
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
+                # ↑ 核心：归还 KV Cache 资源
+                #   1. tree_cache.cache_finished_req(req) 把本次生成的 KV 插入 RadixTree
+                #   2. dec_lock_ref(last_node) 解锁节点，允许 LRU 淘汰
+                #   3. 释放不需要缓存的 KV 物理页（追加到 free_group）
 
             req.time_stats.set_completion_time()
 
@@ -948,6 +975,9 @@ class SchedulerOutputProcessorMixin:
         skip_req: Optional[Req] = None,
         is_idle_batch: bool = False,
     ):
+        # 【学习注释 ⑦】把本批次所有请求的输出打包成 BatchTokenIDOutput
+        # 通过 ZMQ 发给 DetokenizerManager 做文字转换
+        # 注意：每轮 decode 都发，不是等请求完成才发（实现流式输出）
         rids = []
         http_worker_ipcs = []
         finished_reasons: List[BaseFinishReason] = []

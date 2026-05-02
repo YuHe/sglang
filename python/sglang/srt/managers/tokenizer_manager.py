@@ -513,10 +513,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
+        # 【学习注释 ①】全链路入口：HTTP handler 调用此 async generator
+        # 它是一个 async generator 函数（含 yield），每收到一个新 token 就 yield 一次
+        # FastAPI 把每次 yield 的内容写入 SSE 流，实现流式输出
         self.auto_create_handle_loop()
+        # ↑ 确保 handle_loop 协程已经在 asyncio 事件循环中运行（只初始化一次）
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        # ↑ 处理 batch 请求：把 List[str] 展开成多条独立请求
         self._set_default_priority(obj)
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
@@ -531,6 +536,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         self._init_req_state(obj, request)
+        # ↑ 为这条请求创建 ReqState，存入 self.rid_to_state[rid]
+        #   ReqState 含：asyncio.Event（用于跨协程通知）、out_list（输出缓冲）
+        #   rid 是请求的唯一 ID（UUID 字符串），全链路用它关联请求
         if self.server_args.language_only:
             self._handle_epd_disaggregation_encode_request(obj)
         if self.server_args.tokenizer_worker_num > 1:
@@ -541,19 +549,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+            # ↑ 如果 engine 被暂停（如在线更新权重），等待恢复
 
         async with self.model_update_lock.reader_lock:
             await self._validate_and_resolve_lora(obj)
+            # ↑ 验证并解析 LoRA adapter id（多 LoRA 服务场景）
 
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
+                # ↑ 调用 HuggingFace tokenizer：text → token_ids
+                #   多模态时还会处理图像 patch 提取
                 self._send_one_request(tokenized_obj)
+                # ↑ 通过 ZMQ PUSH socket 把 tokenized_obj 发给 Scheduler 子进程
+                #   send_pyobj = pickle 序列化 + zmq send，是非阻塞的
                 async for response in self._wait_one_response(obj, request):
                     yield response
+                # ↑ 挂起等待结果：内部等待 ReqState.event，每次 event.set() 后
+                #   取出 out_list 里的增量 token 并 yield 出去
             else:
                 async for response in self._handle_batch_request(obj, request):
                     yield response
+                # ↑ batch 请求：展开成多条单请求并行处理
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
@@ -698,7 +715,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         """Tokenize one request."""
-        # Tokenize
+        # 优先使用外部传入的 embedding 或 token IDs，避免重复 tokenize
         input_embeds = None
         input_text = obj.text
         token_type_ids = None
@@ -724,10 +741,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "the engine with skip_tokenizer_init=False."
                 )
 
-            # For audio-only requests (e.g., Whisper), text may be empty.
-            # The multimodal processor will provide input_ids later.
+            # 多模态纯音频请求（如 Whisper），multimodal processor 后续会注入 input_ids
             if not input_text and self.mm_processor and obj.contains_mm_input():
-                # Use empty placeholder - multimodal processor will override
                 input_ids = []
             else:
                 input_ids, token_type_ids = await self._tokenize_texts(
@@ -739,11 +754,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "MossVLForConditionalGeneration"
             in self.model_config.hf_config.architectures
         )
+        # 多模态输入或 MossVL 模型需要调用 multimodal processor
         should_run_mm_processor = self.mm_processor is not None and (
             contains_mm_input or is_mossvl
         )
 
         if should_run_mm_processor:
+            # 确保 image/video/audio 数据为 list 格式，便于统一处理
             if obj.image_data is not None and not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]
             if obj.video_data is not None and not isinstance(obj.video_data, list):
@@ -755,6 +772,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             mm_inputs = None
 
+            # language_only 模式下通过 encoder 传输多模态数据时，从 receiver 获取
             if (
                 not self.server_args.language_only
                 or self.server_args.encoder_transfer_backend
@@ -767,6 +785,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         prompt=(input_text or input_ids),
                         need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                     )
+                # 普通模式直接本地处理多模态数据
                 if mm_inputs is None:
                     mm_inputs = await self.mm_processor.process_mm_data_async(
                         image_data=obj.image_data,
@@ -780,8 +799,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
                 and not obj.need_wait_for_mm_inputs
             ):
-                # In language_only mode with zmq_to_scheduler, if we didn't dispatch
-                # to encoder (e.g., only one image), process locally like non-language_only mode
+                # zmq_to_scheduler 模式下非等待类请求，退化为本地处理
                 mm_inputs = await self.mm_processor.process_mm_data_async(
                     image_data=obj.image_data,
                     audio_data=obj.audio_data,
@@ -790,12 +808,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     max_req_input_len=self.max_req_input_len,
                 )
 
+            # 更新 input_ids 和 token_type_ids（可能由 mm_processor 重写）
             if mm_inputs and mm_inputs.input_ids is not None:
                 input_ids = mm_inputs.input_ids
             if mm_inputs and mm_inputs.token_type_ids is not None:
                 token_type_ids = mm_inputs.token_type_ids
                 if not isinstance(token_type_ids, list):
                     token_type_ids = token_type_ids.flatten().tolist()
+            # 预计算 hash 时需要设置 pad_value
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                 and mm_inputs
@@ -818,12 +838,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
         # FIXME: unify the length validation logic with the one in the scheduler.
         _max_req_len = self.context_len
+        # 计算输入token数量，包含预留token
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
 
-        # Validate input length
+        # 验证输入长度是否超过上下文长度
         if input_token_num >= self.context_len:
             if self.server_args.allow_auto_truncate:
+                # 自动截断超出的输入
                 logger.warning(
                     f"The input ({input_token_num} tokens) is longer than the "
                     f"model's context length ({self.context_len} tokens). "
@@ -837,7 +859,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"model's context length ({self.context_len} tokens)."
                 )
 
-        # Validate total tokens (input + max_new_tokens)
+        # 验证总token数（输入 + max_new_tokens）是否超过限制
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
         if (
             self.validate_total_tokens
@@ -845,6 +867,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and (max_new_tokens + input_token_num) > _max_req_len
         ):
             if self.server_args.allow_auto_truncate:
+                # 自动截断max_new_tokens以适应上下文长度
                 logger.warning(
                     f"Requested token count ({input_token_num} input + {max_new_tokens} new) "
                     f"exceeds the model's context length ({self.context_len} tokens). "
@@ -864,19 +887,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 raise ValueError(error_msg)
 
-        # Validate embedding requests
+        # 验证embedding请求：生成模型不支持embedding请求
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
                 "This model does not appear to be an embedding model by default. "
                 "Please add `--is-embedding` when launching the server or try another model."
             )
 
-        # Validate Matryoshka embeddings
+        # 验证Matryoshka嵌入维度参数
         if isinstance(obj, EmbeddingReqInput):
             self._validate_for_matryoshka_dim(obj)
 
-        # Validate custom logit processor
+        # 验证自定义logit processor和hidden states相关配置
         if isinstance(obj, GenerateReqInput):
+            # 检查hidden states返回是否已启用
             if (
                 obj.return_hidden_states
                 and not self.server_args.enable_return_hidden_states
@@ -885,6 +909,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "The server is not configured to return the hidden states. "
                     "Please set `--enable-return-hidden-states` to enable this feature."
                 )
+            # 检查自定义logit processor是否已启用
             if (
                 obj.custom_logit_processor
                 and not self.server_args.enable_custom_logit_processor
@@ -940,16 +965,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _validate_input_ids_in_vocab(
         self, input_ids: Union[List[int], List[List[int]]], vocab_size: int
     ) -> None:
-        # Handle both single sequence and batch of sequences
+        # 区分单条序列与批次序列
         if isinstance(input_ids[0], list):
-            # Batch of sequences
+            # 批次序列：逐条校验
             for seq in input_ids:
+                # 检查是否存在超出词表范围的 token id
                 if any(id >= vocab_size for id in seq):
                     raise ValueError(
                         f"The input_ids {seq} contains values greater than the vocab size ({vocab_size})."
                     )
         else:
-            # Single sequence
+            # 单条序列：直接校验 token id 范围
             if any(id >= vocab_size for id in input_ids):
                 raise ValueError(
                     f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
@@ -965,23 +991,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
-        # Parse sampling parameters
-        # Note: if there are preferred sampling params, we use them if they are not
-        # explicitly passed in sampling_params
+        # 合并采样参数：显式传入的参数优先级高于预设默认值
         if self.preferred_sampling_params:
             sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
             sampling_kwargs = obj.sampling_params
+        # 构造采样参数对象，并做归一化和词表范围校验
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
 
-        # Build return object
+        # 根据请求类型分别构建分词后的请求对象
         if isinstance(obj, GenerateReqInput):
+            # 若存在 session 参数则解析为 SessionParams 对象
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
 
+            # fake 后端下若未指定 bootstrap_room，自动分配递增计数器
             bootstrap_room = obj.bootstrap_room
             if (
                 bootstrap_room is None
@@ -990,6 +1017,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_room = self.fake_bootstrap_room_counter
                 self.fake_bootstrap_room_counter += 1
 
+            # 构建生成请求的分词对象，透传所有字段
             tokenized_obj = TokenizedGenerateReqInput(
                 input_text,
                 input_ids,
@@ -1024,7 +1052,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
             )
         elif isinstance(obj, EmbeddingReqInput):
-            # Resolve unresolved embed overrides now that input_ids are available
+            # 若未预先解析位置嵌入覆盖，则根据 input_ids 和指定 token_id 进行解析
             positional_embed_overrides = obj.positional_embed_overrides
             if (
                 positional_embed_overrides is None
@@ -1035,6 +1063,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     input_ids, obj.embed_override_token_id, obj.embed_overrides
                 )
 
+            # 构建嵌入请求的分词对象
             tokenized_obj = TokenizedEmbeddingReqInput(
                 input_text,
                 input_ids,
@@ -1051,6 +1080,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
             )
 
+        # 将时间统计对象挂载到分词结果，并记录分词完成时间
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
         self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
 
@@ -1626,16 +1656,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     async def handle_loop(self):
         """The event loop that handles requests"""
+        # 【学习注释 ⑨】主进程中持续运行的 asyncio 协程
+        # 负责接收 DetokenizerManager 发来的已解码文字，唤醒对应的 HTTP 等待协程
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+                # ↑ 异步等待 ZMQ 消息，不阻塞其他协程
+                #   收到的是 BatchStrOutput（含多条请求的文字增量）
             if isinstance(
                 recv_obj,
                 (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput),
             ):
                 await self._handle_batch_output(recv_obj)
+                # ↑ 遍历批次里每条请求，找到对应 ReqState，唤醒等待协程
             else:
                 self._result_dispatcher(recv_obj)
+                # ↑ 处理其他控制消息（flush cache 响应、weight update 响应等）
             self.last_receive_tstamp = real_time()
             self.soft_watchdog.feed()
 
@@ -1647,10 +1683,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             BatchTokenIDOutput,
         ],
     ):
+        # 【学习注释 ⑨-续】将批次输出分发给各自等待的 HTTP 协程
         pending_notify: dict[str, ReqState] = {}
         batch_notify_size = self.server_args.batch_notify_size
         for i, rid in enumerate(recv_obj.rids):
+            # ↑ recv_obj.rids 是本批次所有请求的 rid 列表
             state = self.rid_to_state.get(rid, None)
+            # ↑ 用 rid 找到对应的 ReqState（在 generate_request 里创建的）
             if state is None:
                 logger.error(
                     f"Received output for {rid=} but the state was deleted in TokenizerManager."

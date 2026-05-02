@@ -137,12 +137,24 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def event_loop(self):
         """The event loop that handles requests"""
+        # 【学习注释 ⑧】DetokenizerManager 子进程的主循环
+        # 职责：token_ids → 文字，然后转发给 TokenizerManager
+        # 与 TokenizerManager 的 handle_loop 形成一对收发：
+        #   Scheduler → (ZMQ) → DetokenizerManager → (ZMQ) → TokenizerManager
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = self.recv_from_scheduler.recv_pyobj()
+                # ↑ 阻塞等待 Scheduler 发来的 BatchTokenIDOutput
+                #   包含本轮批次所有请求的 rid + output_ids（token id list）
             output = self._request_dispatcher(recv_obj)
+            # ↑ 根据类型分发：
+            #   BatchTokenIDOutput → handle_batch_token_id_out()
+            #     逐条增量 decode：新 token ids → 新文字（不从头重新 decode）
+            #   BatchEmbeddingOutput → 直接透传（embedding 不需要 detokenize）
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
+                # ↑ 把 BatchStrOutput（含各请求的增量文字）发回主进程
+                #   TokenizerManager.handle_loop() 收到后唤醒对应的 HTTP 协程
             self.soft_watchdog.feed()
 
     def trim_matched_stop(

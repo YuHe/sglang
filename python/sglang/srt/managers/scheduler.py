@@ -1468,28 +1468,41 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        # 【学习注释 ③】Scheduler 子进程的主循环（非 overlap 版本）
+        # 每次迭代 = 一个批次：收请求 → 调度 → GPU 执行 → 处理结果
+        # 全程在同一个 CPU 线程里顺序执行，GPU 执行期间 CPU 阻塞等待
         while True:
             # Receive requests
             recv_reqs = self.recv_requests()
+            # ↑ 见 recv_requests()：非阻塞拉取所有新到达的请求
             self.process_input_requests(recv_reqs)
+            # ↑ 把收到的请求解析成 Req 对象，放入 self.waiting_queue
             if self._engine_paused:
                 self.cancel_bubble_timer()
                 continue
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
+            # ↑ 核心调度决策：从 waiting_queue + running_batch 凑一批
+            #   返回 ScheduleBatch 或 None（无任务时）
             self.cur_batch = batch
 
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
+                # ↑ 转换数据结构 → 送 GPU → 等待结果（同步阻塞）
                 self.process_batch_result(batch, result)
+                # ↑ 处理输出：追加 token、检查 finish、更新 RadixCache、发给 Detokenizer
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
+                # ↑ 无任务：做 GC 清理、指标上报、RadixCache 内存检查等
 
             # Update last_batch
             self.last_batch = batch
+            # ↑ 保存本轮批次供下一轮使用
+            #   get_next_batch_to_run 需要知道上轮是 EXTEND 还是 DECODE
+            #   以决定是否把刚完成 prefill 的请求合并进 running_batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 
@@ -1585,12 +1598,16 @@ class Scheduler(
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
             return False
+        # 当已接收请求数达到限制时返回 True
         return num_recv_reqs >= self.max_recv_per_poll
 
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
+        # 【学习注释 ②】非阻塞地从 ZMQ 队列取出所有待处理请求
+        # 这是"批量"形成的关键：并发的 HTTP 请求都排在同一个 ZMQ 队列里
+        # 一次性清空队列，本轮循环就自然拿到了多条并发请求
 
         if self.recv_skipper is not None:
             last_forward_mode = (
@@ -1598,6 +1615,7 @@ class Scheduler(
             )
             if not self.recv_skipper.handle(last_forward_mode):
                 return []
+            # overlap 模式下按需跳过收包，减少调度开销
 
         if self.pp_rank == 0:
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
@@ -1607,9 +1625,12 @@ class Scheduler(
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
+                            # ↑ 防止单轮收包过多导致调度延迟（有上限）
                         recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                        # ↑ zmq.NOBLOCK：非阻塞！有消息就取，没消息立刻抛 ZMQError
+                        #   取出的对象是 TokenizedGenerateReqInput（已完成 tokenize）
                     except zmq.ZMQError:
-                        break
+                        break  # ↑ 队列空了，退出循环
                     recv_reqs.append(recv_req)
 
                 while True:
@@ -1617,12 +1638,14 @@ class Scheduler(
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
                         recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+                        # 接收来自 RPC 的额外请求
                     except zmq.ZMQError:
-                        break
+                        break  # RPC 队列已空
                     recv_reqs.append(recv_rpc)
             else:
                 recv_reqs = None
         else:
+            # Pipeline Parallel 非首 stage：从前一个 stage 点对点接收
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
                 dp_offset = self.attn_dp_rank * self.attn_tp_size
                 recv_reqs = point_to_point_pyobj(
@@ -1633,18 +1656,21 @@ class Scheduler(
                     self.pp_rank * self.tp_size + dp_offset,
                 )
             else:
-                recv_reqs = None
+                recv_reqs = None  # 非 leader rank 不直接参与通信
 
         if self.input_blocker is not None:
+            # 输入阻断器：用于可控地暂停或过滤请求
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
         if self.server_args.enable_dp_attention:
+            # DP Attention 模式：拆分工作请求与控制请求，分别广播
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
             else:
                 work_reqs = None
                 control_reqs = None
 
+            # 在 attn_tp_group 内广播工作请求
             if self.attn_tp_size != 1:
                 work_reqs = broadcast_pyobj(
                     work_reqs,
@@ -1653,6 +1679,7 @@ class Scheduler(
                     src=self.attn_tp_group.ranks[0],
                 )
 
+            # 在 attn_cp_group 内广播工作请求
             if self.attn_cp_size != 1:
                 work_reqs = broadcast_pyobj(
                     work_reqs,
@@ -1661,11 +1688,9 @@ class Scheduler(
                     src=self.attn_cp_group.ranks[0],
                 )
 
-            # When dp_attention_local_control_broadcast is enabled, each DP
-            # group leader already receives control messages from the DP
-            # controller, so we broadcast within attn_tp_group + attn_cp_group
-            # instead of the full tp_group.  This avoids an expensive
-            # all-ranks gloo sync.
+            # 控制请求广播策略：
+            # 启用 local_control_broadcast 时，仅在 attn_tp + attn_cp 组内广播，
+            # 避免全量 tp_group 的昂贵 gloo 同步。
             _local_ctrl = self.server_args.enable_dp_attention_local_control_broadcast
             if _local_ctrl:
                 if self.attn_tp_size != 1:
@@ -1683,6 +1708,7 @@ class Scheduler(
                         src=self.attn_cp_group.ranks[0],
                     )
             elif self.tp_size != 1:
+                # 未启用 local control 时，在完整 tp_group 内广播控制请求
                 control_reqs = broadcast_pyobj(
                     control_reqs,
                     self.tp_group.rank,
@@ -1691,6 +1717,7 @@ class Scheduler(
                 )
             recv_reqs = work_reqs + control_reqs
         elif self.tp_size != 1:
+            # 非 DP Attention 模式：在完整 tp_group 内广播所有请求
             recv_reqs = broadcast_pyobj(
                 recv_reqs,
                 self.tp_group.rank,
@@ -1698,13 +1725,14 @@ class Scheduler(
                 src=self.tp_group.ranks[0],
             )
 
-        # Process MM requests under EPD-disaggregation mode
+        # EPD-disaggregation 模式下处理多模态请求
         if (
             self.pp_rank == 0
             and self.server_args.language_only
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
         ):
             recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+            # 处理需要中止的请求，返回错误并输出流结果
             for req, error_msg, error_code in abort_reqs:
                 status_code = (
                     HTTPStatus.BAD_REQUEST
@@ -1714,24 +1742,17 @@ class Scheduler(
                 prepare_abort(req, error_msg, status_code=status_code)
                 self.stream_output([req], req.return_logprob)
 
-        # Unwrap shared memory features AFTER all broadcasts complete,
-        # so that ShmPointerMMData metadata (not full tensor data) is what
-        # gets serialized during broadcast_pyobj.
+        # 所有广播完成后解包共享内存数据，
+        # 使得广播过程中只序列化 ShmPointerMMData 元数据而非完整张量。
         if recv_reqs:
-            # Barrier for the non-DP-attention path only: there is a single
-            # broadcast_pyobj on tp_cpu_group where the source rank returns
-            # the original objects immediately while other ranks are still in
-            # pickle.loads (-> __setstate__ -> shm_open).  Without a barrier
-            # the source can call materialize() / shm_unlink before others
-            # open the segment.  recv_reqs is consistent across all ranks
-            # here (same broadcast), so the guard is deadlock-free.
-            #
-            # Under DP-attention no barrier is needed: the control_reqs
-            # broadcast on tp_cpu_group (step 3) is a collective that forces
-            # every rank to complete the earlier attn_tp / attn_cp work_reqs
-            # deserializations (steps 1-2, which call shm_open) before any
-            # rank returns from step 3.  POSIX guarantees shm_unlink only
-            # removes the name; already-open handles stay valid.
+            # 非 DP Attention 路径需要 barrier：
+            # source rank 在 broadcast_pyobj 后立即返回，而其他 rank 仍在
+            # pickle.loads -> __setstate__ -> shm_open 过程中。
+            # 若无 barrier，source 可能先调用 materialize/shm_unlink，
+            # 导致其他 rank 无法打开共享内存段。
+            # DP Attention 路径不需要 barrier：
+            # control_reqs 在 tp_cpu_group 上的广播（step 3）是集体操作，
+            # 会强制所有 rank 先完成前面 work_reqs 的反序列化（含 shm_open）。
             if (
                 not self.server_args.enable_dp_attention
                 and self.tp_size > 1
@@ -2386,8 +2407,12 @@ class Scheduler(
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        # 【学习注释 ④】核心调度决策函数，决定本轮 GPU 跑哪些请求
+        # 逻辑：上轮 prefill 完的请求先合并进 running_batch，再看要不要新 prefill
+        # 返回值：ScheduleBatch（forward_mode=EXTEND/DECODE/MIXED）或 None
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
+        # ↑ 超时的请求直接 abort，防止一条慢请求占用资源
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
@@ -2423,6 +2448,8 @@ class Scheduler(
             and self.last_batch
             and self.last_batch.forward_mode.is_extend()
         ):
+            # ↑ 上一轮是 EXTEND（prefill）：把完成 prefill 的请求合并进 running_batch
+            #   这些请求下一轮就会进入 DECODE 阶段（每步生成 1 个 token）
             if self.last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
@@ -2461,6 +2488,8 @@ class Scheduler(
             new_batch = self.get_new_batch_dllm()
         else:
             new_batch = self.get_new_batch_prefill()
+            # ↑ 尝试从 waiting_queue 凑新的 prefill 批次
+            #   → _get_new_batch_prefill_raw()
 
         need_mlp_sync = self.require_mlp_sync
         if (
@@ -2478,6 +2507,7 @@ class Scheduler(
         if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
+            # ↑ 有新 prefill 批次：优先做 prefill（EXTEND 或 MIXED）
         else:
             # Run decode (skip for prefill-only batches)
             if (
@@ -2486,8 +2516,10 @@ class Scheduler(
             ):
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
+                # ↑ 没有新 prefill：跑 running_batch 里的 decode 请求
             else:
                 ret = None
+                # ↑ 没有任何请求可跑 → 返回 None → event_loop 调用 on_idle()
 
         # Handle DP attention and log stats
         ret = self.maybe_prepare_mlp_sync_batch(ret, need_sync=need_mlp_sync)
@@ -2527,6 +2559,8 @@ class Scheduler(
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
+        # 【学习注释 ④-续】从 waiting_queue 选出哪些请求做 prefill
+        # 核心约束：总 token 数 ≤ max_prefill_tokens，KV Cache 空间够用
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -2544,6 +2578,7 @@ class Scheduler(
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
             return None
+            # ↑ 快速返回：batch 已满 或 等待队列空，不需要新 prefill
 
         running_bs = len(self.running_batch.reqs)
 
@@ -2562,6 +2597,8 @@ class Scheduler(
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
+        # ↑ cache-aware 排序：优先调度能复用更多 RadixCache 前缀的请求
+        #   相同系统 prompt 的请求会聚在一起，让 KV 共享最大化
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -2594,6 +2631,12 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
         )
+        # ↑ PrefillAdder 逐条"试填"请求：
+        #   add_one_req(req) 内部会：
+        #     1. tree_cache.match_prefix(req.token_ids) → 查 RadixCache 命中了多少
+        #     2. 估算需要新分配的 KV Cache 页数
+        #     3. 空间够 → alloc KV → 加入批次
+        #     4. 空间不够 or token 预算超 → 停止
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
@@ -2867,6 +2910,8 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        # 【学习注释 ⑤】把 ScheduleBatch 转换并送到 GPU 执行，返回结果
+        # 数据变换链：ScheduleBatch → ModelWorkerBatch → (ModelRunner) → ForwardBatch
         self.forward_ct += 1
 
         # Whether to run the profiler
@@ -2882,12 +2927,17 @@ class Scheduler(
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
+            # ↑ PD 解耦场景：KV Cache 已从 Prefill 实例传输过来，直接进 decode
 
         # Run forward
         if self.is_generation:
             if self.spec_algorithm.is_none() or self.enable_overlap:
                 # In most cases, we use the model worker batch to run the forward.
                 worker_batch_or_batch = batch.get_model_worker_batch()
+                # ↑ ScheduleBatch → ModelWorkerBatch
+                #   把 List[Req] 里的字段提取并打包成 tensor
+                #   例：[req.fill_ids] → input_ids tensor
+                #       [req.kv_committed_len] → extend_prefix_lens
             else:
                 # In speculative decoding v1 (non-overlap) case, we use the batch directly.
                 # TODO(lsyin): delete this branch after unifying the abstraction.
@@ -2951,6 +3001,15 @@ class Scheduler(
                     batch_result = self.model_worker.forward_batch_generation(
                         worker_batch_or_batch, **kwargs
                     )
+                    # ↑ TpModelWorker.forward_batch_generation()
+                    #     → ModelRunner.forward_batch_generation()
+                    #       → 构造 ForwardBatch（全 GPU tensor）
+                    #       → attention_backend.init_forward_metadata()
+                    #       → model.forward()  真正执行 transformer
+                    #       → logits_processor + sampler → next_token_ids
+                    # 返回 GenerationBatchResult：
+                    #   next_token_ids: GPU tensor shape [batch_size]
+                    #   logits_output: 含 logprobs 等附加信息
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 
@@ -3048,6 +3107,9 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        # 【学习注释 ⑥】根据 forward_mode 分发到对应的结果处理函数
+        # DECODE → process_batch_result_decode（每步 1 token）
+        # EXTEND → process_batch_result_prefill（prefill 产出第 1 个 token）
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
