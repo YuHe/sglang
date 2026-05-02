@@ -21,6 +21,57 @@
 <a href="https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides"><b>Slides</b></a>
 </p>
 
+---
+
+## 📖 本 Fork 的学习资料（中文）
+
+> 本仓库在官方 SGLang 基础上，新增了一套**面向源码学习**的中文注释和文档体系。
+> 目标：不逐行读源码，1 小时内掌握 SGLang 从请求入 → Token 返回的所有核心机制。
+
+### 快速导航
+
+| 文档 | 说明 | 适合场景 |
+|---|---|---|
+| [SGLANG_SOURCE_GUIDE.md](./SGLANG_SOURCE_GUIDE.md) | 代码库全局导览：目录结构、核心模块、关键文件索引 | 第一次接触 SGLang 源码 |
+| [SGLANG_BATCH_FLOW.md](./SGLANG_BATCH_FLOW.md) | 批量请求数据流蓝图（ASCII 流程图） | 快速建立宏观认知 |
+| [SGLANG_ANNOTATED.md](./SGLANG_ANNOTATED.md) | 关键数据结构（Req、ScheduleBatch 等）注释说明 | 搞清楚字段含义时 |
+| [SGLANG_REQUEST_FLOW.md](./SGLANG_REQUEST_FLOW.md) | **极端细化的完整请求数据流**，含所有特殊情况 | 深度掌握运转逻辑 |
+
+### 源码内联注释
+
+以下文件已添加 `【学习注释 ①②…】` 标记，可全局搜索 `【学习注释` 快速定位：
+
+| 文件 | 注释覆盖的关键函数 |
+|---|---|
+| [python/sglang/srt/managers/tokenizer_manager.py](./python/sglang/srt/managers/tokenizer_manager.py) | `generate_request`（全链路入口）、`handle_loop`（流式唤醒） |
+| [python/sglang/srt/managers/scheduler.py](./python/sglang/srt/managers/scheduler.py) | `event_loop_normal`、`recv_requests`、`get_next_batch_to_run`、`run_batch`、`process_batch_result` |
+| [python/sglang/srt/managers/scheduler_output_processor_mixin.py](./python/sglang/srt/managers/scheduler_output_processor_mixin.py) | `process_batch_result_prefill/decode`、`_handle_finished_req`、`stream_output_generation` |
+| [python/sglang/srt/managers/detokenizer_manager.py](./python/sglang/srt/managers/detokenizer_manager.py) | `event_loop`（增量 detokenize） |
+
+### 建议学习路线
+
+```
+1. 读 SGLANG_SOURCE_GUIDE.md       → 了解整体架构和进程拓扑（15 分钟）
+2. 读 SGLANG_BATCH_FLOW.md         → 建立数据流直觉（10 分钟）
+3. 读 SGLANG_REQUEST_FLOW.md       → 深入所有细节和特殊情况（30 分钟）
+4. 左边开 SGLANG_REQUEST_FLOW.md   → 右边对照带【学习注释】的源码（随时）
+5. 遇到不懂的概念，直接搜索源码里的注释标记
+```
+
+---
+
+## About
+
+SGLang is a high-performance serving framework for large language models and multimodal models.
+It is designed to deliver low-latency and high-throughput inference across a wide range of setups, from a single GPU to large distributed clusters.
+Its core features include:
+
+- **Fast Runtime**: Provides efficient serving with RadixAttention for prefix caching, a zero-overhead CPU scheduler, prefill-decode disaggregation, speculative decoding, continuous batching, paged attention, tensor/pipeline/expert/data parallelism, structured outputs, chunked prefill, quantization (FP4/FP8/INT4/AWQ/GPTQ), and multi-LoRA batching.
+- **Broad Model Support**: Supports a wide range of language models (Llama, Qwen, DeepSeek, Kimi, GLM, GPT, Gemma, Mistral, etc.), embedding models (e5-mistral, gte, mcdse), reward models (Skywork), and diffusion models (WAN, Qwen-Image), with easy extensibility for adding new models. Compatible with most Hugging Face models and OpenAI APIs.
+- **Extensive Hardware Support**: Runs on NVIDIA GPUs (GB200/B300/H100/A100/Spark/5090), AMD GPUs (MI355/MI300), Intel Xeon CPUs, Google TPUs, Ascend NPUs, and more.
+- **Active Community**: SGLang is open-source and supported by a vibrant community with widespread industry adoption, powering over 400,000 GPUs worldwide.
+- **RL & Post-Training Backbone**: SGLang is a proven rollout backend used for training many frontier models, with native RL integrations and adoption by well-known post-training frameworks such as [**AReaL**](https://github.com/inclusionAI/AReaL), [**Miles**](https://github.com/radixark/miles), [**slime**](https://github.com/THUDM/slime), [**Tunix**](https://github.com/google/tunix), [**verl**](https://github.com/volcengine/verl) and more.
+
 ## News
 - [2026/02] 🔥 Unlocking 25x Inference Performance with SGLang on NVIDIA GB300 NVL72 ([blog](https://lmsys.org/blog/2026-02-20-gb300-inferencex/)).
 - [2026/01] 🔥 SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2026-01-16-sglang-diffusion/)).
@@ -28,7 +79,7 @@
 - [2025/10] 🔥 SGLang now runs natively on TPU with the SGLang-Jax backend ([blog](https://lmsys.org/blog/2025-10-29-sglang-jax/)).
 - [2025/09] Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP (Part II): 3.8x Prefill, 4.8x Decode Throughput ([blog](https://lmsys.org/blog/2025-09-25-gb200-part-2/)).
 - [2025/09] SGLang Day 0 Support for DeepSeek-V3.2 with Sparse Attention ([blog](https://lmsys.org/blog/2025-09-29-deepseek-V32/)).
-- [2025/08] SGLang x AMD SF Meetup on 8/22: Hands-on GPU workshop, tech talks by AMD/xAI/SGLang, and networking ([Roadmap](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_roadmap.pdf), [Large-scale EP](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_ep.pdf), [Highlights](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_highlights.pdf), [AITER/MoRI](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_aiter_mori.pdf), [Wave](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_wave.pdf)).
+- [2025/08] SGLang x AMD SF Meetup on 8/22 ([Roadmap](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_roadmap.pdf), [Large-scale EP](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_ep.pdf)).
 
 <details>
 <summary>More</summary>
@@ -43,7 +94,7 @@
 - [2025/03] Supercharge DeepSeek-R1 Inference on AMD Instinct MI300X ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1-Part2/README.html))
 - [2025/03] SGLang Joins PyTorch Ecosystem: Efficient LLM Serving Engine ([PyTorch blog](https://pytorch.org/blog/sglang-joins-pytorch/))
 - [2025/02] Unlock DeepSeek-R1 Inference Performance on AMD Instinct™ MI300X GPU ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1_Perf/README.html))
-- [2025/01] SGLang provides day one support for DeepSeek V3/R1 models on NVIDIA and AMD GPUs with DeepSeek-specific optimizations. ([instructions](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3), [AMD blog](https://www.amd.com/en/developer/resources/technical-articles/amd-instinct-gpus-power-deepseek-v3-revolutionizing-ai-development-with-sglang.html), [10+ other companies](https://x.com/lmsysorg/status/1887262321636221412))
+- [2025/01] SGLang provides day one support for DeepSeek V3/R1 models on NVIDIA and AMD GPUs. ([instructions](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3), [AMD blog](https://www.amd.com/en/developer/resources/technical-articles/amd-instinct-gpus-power-deepseek-v3-revolutionizing-ai-development-with-sglang.html))
 - [2024/12] v0.4 Release: Zero-Overhead Batch Scheduler, Cache-Aware Load Balancer, Faster Structured Outputs ([blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/)).
 - [2024/10] The First SGLang Online Meetup ([slides](https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#the-first-sglang-online-meetup)).
 - [2024/09] v0.3 Release: 7x Faster DeepSeek MLA, 1.5x Faster torch.compile, Multi-Image/Video LLaVA-OneVision ([blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/)).
@@ -53,17 +104,6 @@
 - [2024/01] SGLang powers the serving of the official **LLaVA v1.6** release demo ([usage](https://github.com/haotian-liu/LLaVA?tab=readme-ov-file#demo)).
 
 </details>
-
-## About
-SGLang is a high-performance serving framework for large language models and multimodal models.
-It is designed to deliver low-latency and high-throughput inference across a wide range of setups, from a single GPU to large distributed clusters.
-Its core features include:
-
-- **Fast Runtime**: Provides efficient serving with RadixAttention for prefix caching, a zero-overhead CPU scheduler, prefill-decode disaggregation, speculative decoding, continuous batching, paged attention, tensor/pipeline/expert/data parallelism, structured outputs, chunked prefill, quantization (FP4/FP8/INT4/AWQ/GPTQ), and multi-LoRA batching.
-- **Broad Model Support**: Supports a wide range of language models (Llama, Qwen, DeepSeek, Kimi, GLM, GPT, Gemma, Mistral, etc.), embedding models (e5-mistral, gte, mcdse), reward models (Skywork), and diffusion models (WAN, Qwen-Image), with easy extensibility for adding new models. Compatible with most Hugging Face models and OpenAI APIs.
-- **Extensive Hardware Support**: Runs on NVIDIA GPUs (GB200/B300/H100/A100/Spark/5090), AMD GPUs (MI355/MI300), Intel Xeon CPUs, Google TPUs, Ascend NPUs, and more.
-- **Active Community**: SGLang is open-source and supported by a vibrant community with widespread industry adoption, powering over 400,000 GPUs worldwide.
-- **RL & Post-Training Backbone**: SGLang is a proven rollout backend used for training many frontier models, with native RL integrations and adoption by well-known post-training frameworks such as [**AReaL**](https://github.com/inclusionAI/AReaL), [**Miles**](https://github.com/radixark/miles), [**slime**](https://github.com/THUDM/slime), [**Tunix**](https://github.com/google/tunix), [**verl**](https://github.com/volcengine/verl) and more.
 
 ## Getting Started
 - [Install SGLang](https://docs.sglang.io/get_started/install.html)
