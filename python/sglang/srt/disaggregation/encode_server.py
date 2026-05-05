@@ -1,3 +1,6 @@
+# 编码服务器模块：负责多模态（图像/视频/音频）特征提取，并将 embedding 传输给 Prefill 端
+# 在 PD 分离架构中，encode_server 作为独立服务运行，对多模态输入进行 ViT 编码后
+# 通过 ZMQ 或 Mooncake 传输引擎将 embedding 发送到 Prefill 调度器
 import asyncio
 import concurrent.futures
 import ctypes
@@ -59,26 +62,36 @@ from sglang.srt.utils.network import (
 
 logger = logging.getLogger(__name__)
 
+# 健康检查的超时时间（秒）
 HEALTH_CHECK_TIMEOUT = 10
 
 # Minimal 32x32 black PNG for health check dummy encode
+# 用于健康检查的最小黑色 PNG 图片（32x32，Base64 编码）
 MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
 # Minimal WAV: 16kHz mono 16-bit PCM, 160 samples (0.01s) of silence
+# 用于健康检查的最小静音 WAV 音频（16kHz 单声道，160 样本，Base64 编码）
 MINIMUM_WAV_SILENCE_BASE64 = "UklGRmQBAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YUABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
 
+# 请求 ID 到接收端点列表的映射，用于 zmq_to_scheduler 传输模式
 rid_lock = asyncio.Lock()
 rid_to_receive_endpoint: Dict[str, List[str]] = dict()
+# 每个请求 ID 期望的接收端点数量
 rid_to_receive_count: Dict[str, int] = dict()
+# 记录每个请求 ID 对应的错误信息
 rid_to_err_msg: Dict[str, str] = dict()
+# 用于等待接收端点注册的条件变量字典锁
 cond_dict_lock = asyncio.Lock()
+# 每个请求 ID 对应的异步条件变量，用于通知 send_with_url 有新端点到达
 rid_to_cond: Dict[str, asyncio.Condition] = {}
 
+# 是否使用 GPU 进行图像预处理（由环境变量控制）
 use_image_processor_gpu = (
     int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
 )
 
 
+# 多模态编码错误基类，携带 HTTP 状态码
 class MMError(Exception):
     def __init__(self, message, code=HTTPStatus.INTERNAL_SERVER_ERROR):
         self.message = message
@@ -86,32 +99,38 @@ class MMError(Exception):
         super().__init__(self.message)
 
 
+# 客户端请求格式错误（400）
 class BadRequestError(MMError):
     def __init__(self, message):
         super().__init__(message, code=HTTPStatus.BAD_REQUEST)
 
 
+# 服务端内部错误（500）
 class InternalError(MMError):
     def __init__(self, message):
         super().__init__(message, code=HTTPStatus.INTERNAL_SERVER_ERROR)
 
 
 class TensorWrapper:
-    """Wrapper to keep tensor alive while exposing buffer for zero-copy."""
+    """Wrapper to keep tensor alive while exposing buffer for zero-copy.
+    零拷贝传输辅助类：持有张量引用防止被 GC 回收，同时暴露底层内存缓冲区"""
 
     def __init__(self, tensor):
         # Ensure tensor is on CPU and contiguous
+        # 确保张量在 CPU 上且内存连续，用于 ZMQ 零拷贝发送
         if tensor.is_cuda:
             tensor = tensor.cpu()
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
 
         # Keep tensor reference
+        # 持有张量引用，防止在缓冲区被消费前被垃圾回收
         self.tensor = tensor
         self.shape = list(tensor.shape)
         self.dtype = tensor.dtype
 
     def __buffer__(self):
+        # 通过 ctypes 将张量底层内存暴露为 memoryview，实现零拷贝传输
         data_ptr = self.tensor.data_ptr()
         total_bytes = self.tensor.numel() * self.tensor.element_size()
         c_obj = (ctypes.c_char * total_bytes).from_address(data_ptr)
@@ -120,6 +139,7 @@ class TensorWrapper:
 
 
 def _convert(data):
+    # 将 numpy 数组或数值列表统一转换为 torch.Tensor，保持原有张量不变
     if isinstance(data, torch.Tensor):
         return data
     elif isinstance(data, np.ndarray):
@@ -132,6 +152,7 @@ def _convert(data):
         return data
 
 
+# 各模态对应的网格尺寸属性名（用于从处理器输出中提取 patch grid 维度）
 _mm_grid_attrs = {
     # Kimi K2.5 HF processor uses grid_thws (see base_processor.ATTR_NAME_TO_MODALITY).
     Modality.IMAGE: ["image_grid_thw", "image_grid_hws", "grid_thws"],
@@ -139,6 +160,7 @@ _mm_grid_attrs = {
     Modality.AUDIO: ["audio_feature_lens_raw"],
 }
 
+# 各模态对应的特征张量属性名（用于从处理器输出中提取 pixel_values 等特征）
 _mm_feature_attrs = {
     Modality.IMAGE: ["pixel_values"],
     Modality.VIDEO: ["pixel_values_videos"],
@@ -147,6 +169,7 @@ _mm_feature_attrs = {
 
 
 def _get_mm_grid_dim(mm_inputs, modality, model_type: Optional[str] = None):
+    # 从处理器输出中提取指定模态的网格维度（patch grid），支持多种模型的属性名差异
     # Kimi K2.5 vision processor only emits `grid_thws`; prefer it over generic keys
     # so we never pick a mis-typed or stale `image_grid_hws` field from kwargs.
     attrs = _mm_grid_attrs[modality]
@@ -162,6 +185,7 @@ def _get_mm_grid_dim(mm_inputs, modality, model_type: Optional[str] = None):
 
 
 def _get_mm_feature(mm_inputs, modality):
+    # 从处理器输出中提取指定模态的原始特征张量（如 pixel_values）
     for attr in _mm_feature_attrs[modality]:
         if attr in mm_inputs:
             return mm_inputs[attr]
@@ -173,6 +197,7 @@ def _get_mm_feature(mm_inputs, modality):
 def _build_mm_aux_data(mm_inputs):
     """
     Build auxiliary data for video modality.
+    构建视频模态的辅助元数据（时间戳、每格时间等），用于旋转位置编码计算
     """
     aux_data = {
         "video_timestamps": mm_inputs.get("video_timestamps", None),
@@ -182,6 +207,8 @@ def _build_mm_aux_data(mm_inputs):
 
 
 class MMEncoder:
+    # 多模态编码器：在 PD 分离的 Prefill 端负责将图像/视频/音频输入编码为 embedding
+    # 支持张量并行（TP），所有 TP rank 协同运行 ViT/视觉编码器
     def __init__(
         self,
         server_args: ServerArgs,
@@ -191,11 +218,14 @@ class MMEncoder:
     ):
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
+        # 将全局 ServerArgs 注入调度器模块
         set_global_server_args_for_scheduler(server_args)
         self.rank = rank
         self.profiler = EncoderProfiler(rank)
+        # 分别加载图像/视频/音频处理器
         self._load_mm_processor(server_args)
 
+        # 从 ServerArgs 构建模型配置
         self.model_config = ModelConfig.from_server_args(
             server_args,
         )
@@ -207,11 +237,13 @@ class MMEncoder:
             remote_instance_weight_loader_seed_instance_service_port=server_args.remote_instance_weight_loader_seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,
         )
+        # 获取模型类型（小写），用于各模型的特殊处理分支
         self.model_type = getattr(
             self.model_config.hf_config, "model_type", "unknown"
         ).lower()
 
         self.device = server_args.device
+        # 每个 rank 对应的 GPU ID（base_gpu_id + rank 偏移）
         self.gpu_id = server_args.base_gpu_id + rank
 
         self.device_config = DeviceConfig(
@@ -219,13 +251,16 @@ class MMEncoder:
             gpu_id=self.gpu_id,
         )
 
+        # 设置当前进程使用的 GPU 设备
         torch.get_device_module(self.device).set_device(self.gpu_id)
 
         self.use_image_processor_gpu = (
             use_image_processor_gpu and not server_args.disable_fast_image_processor
         )
+        # 构建并校验视觉/音频处理配置（fps、max_frames 等）
         self._build_vision_config(server_args.mm_process_config)
 
+        # 初始化分布式环境，支持多卡张量并行
         init_distributed_environment(
             backend=get_default_distributed_backend(self.device),
             world_size=server_args.tp_size,
@@ -236,31 +271,40 @@ class MMEncoder:
         initialize_model_parallel(tensor_model_parallel_size=server_args.tp_size)
         initialize_dp_attention(server_args, self.model_config)
 
+        # 加载视觉语言模型（仅视觉编码器部分参与推理）
         self.model = get_model(
             model_config=self.model_config,
             load_config=self.load_config,
             device_config=self.device_config,
         )
 
+        # 异步 ZMQ 上下文和同步 ZMQ 上下文（线程池中使用）
         self.context = zmq.asyncio.Context(2)
         self.sync_context = zmq.Context()  # Reuse sync context for thread pool
+        # 线程池用于并行发送 ZMQ 消息（避免阻塞 asyncio 事件循环）
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
+        # 本地 embedding 缓存，大小由 SGLANG_VLM_CACHE_SIZE_MB 控制（默认 4096MB）
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "4096"))
         self.mm_cache = MultiModalStaticCache(embedding_cache_size * 1024 * 1024)
         self.mm_cache_lock = asyncio.Lock()
 
+        # 多模态数据 I/O 线程池，用于并发加载图像/视频/音频文件
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=int(os.environ.get("SGLANG_ENCODER_MM_LOAD_WORKERS", 4))
         )
+        # 发送超时时间
         self.send_timeout = envs.SGLANG_ENCODER_SEND_TIMEOUT.get()
 
+        # 如果提供了调度路径，创建 ZMQ PULL socket 从调度器接收编码请求
         if schedule_path is not None:
             self.schedule_socket = get_zmq_socket(
                 self.context, zmq.PULL, schedule_path, True
             )
+        # 后台异步任务集合，用于追踪并发的发送任务
         self.background_tasks: Set[asyncio.Task] = set()
 
+        # 若启用全局多模态缓存（跨请求共享），初始化 EmbeddingCacheController
         if self.server_args.enable_mm_global_cache:
             from sglang.srt.mem_cache.storage.mooncake_store.embedding_cache_controller import (
                 EmbeddingCacheController,
@@ -277,11 +321,13 @@ class MMEncoder:
         else:
             self.mm_global_cache = None
 
+        # rank 0 负责实际的 embedding 发送，其余 rank 仅参与分布式推理
         if self.rank == 0:
             logger.info(
                 f"Using transfer backend: {self.server_args.encoder_transfer_backend}"
             )
 
+            # 若使用 Mooncake 传输引擎，初始化 RDMA 传输引擎用于高速 KV 传输
             if self.server_args.encoder_transfer_backend == "mooncake":
                 self.local_ip = get_local_ip_auto()
 
@@ -300,14 +346,17 @@ class MMEncoder:
                         ),
                     )
 
+            # 待发送的 embedding 字典：req_id -> EmbeddingData
             self.embedding_to_send = dict()
 
         logger.info(f"rank {rank} init finish ")
 
     def _infer_embedding_dims(self) -> dict:
-        """Infer per-modality embedding dimensions from hf_config at init time."""
+        """Infer per-modality embedding dimensions from hf_config at init time.
+        根据 hf_config 推断各模态 embedding 的隐藏维度，用于全局缓存分配"""
         default = self.model_config.hidden_size
         hf_cfg = self.model_config.hf_config
+        # Omni 模型（如 Qwen3-Omni）的 thinker 子配置
         thinker_cfg = getattr(hf_cfg, "thinker_config", None)
         dims = {
             Modality.IMAGE: default,
@@ -315,12 +364,14 @@ class MMEncoder:
             Modality.AUDIO: default,
         }
 
+        # 优先从 thinker_config 或顶层 hf_config 获取视觉配置
         vision_cfg = getattr(thinker_cfg, "vision_config", None) or getattr(
             hf_cfg, "vision_config", None
         )
         if vision_cfg is not None:
             out_hs = getattr(vision_cfg, "out_hidden_size", None)
             if out_hs is not None:
+                # 若存在 deepstack 多尺度索引，维度需乘以层数
                 ds = getattr(vision_cfg, "deepstack_visual_indexes", None)
                 vis_dim = (
                     out_hs * (1 + len(ds))
@@ -330,6 +381,7 @@ class MMEncoder:
                 dims[Modality.IMAGE] = vis_dim
                 dims[Modality.VIDEO] = vis_dim
 
+        # 推断音频编码器输出维度
         audio_cfg = getattr(thinker_cfg, "audio_config", None) or getattr(
             hf_cfg, "audio_config", None
         )
@@ -347,6 +399,7 @@ class MMEncoder:
         """
         Validate vision config, used for image/video/audio.
         If not provided, keep default values.
+        校验并补全视觉/音频处理配置，设置各模态的默认参数（fps、padding 等）
         """
         self.vision_config = (
             mm_process_config.get("vision_config", {})
@@ -354,17 +407,21 @@ class MMEncoder:
             else {}
         )
         for modality_str in ["image", "video", "audio"]:
+            # 确保每个模态都有对应的配置字典
             if not self.vision_config.get(modality_str, None):
                 self.vision_config[modality_str] = {}
+            # 若使用 GPU 图像处理器，注入设备信息
             if self.use_image_processor_gpu:
                 self.vision_config[modality_str]["device"] = self.device
 
             if modality_str == "video":
+                # 视频模态默认参数：采样帧率 2fps，最大帧数 768，最小帧数 4
                 video_defaults = {"fps": 2.0, "max_frames": 768, "min_frames": 4}
                 for k, v in video_defaults.items():
                     self.vision_config["video"].setdefault(k, v)
 
             if modality_str == "audio":
+                # 音频模态默认启用 attention_mask 返回
                 if "return_attention_mask" not in self.vision_config["audio"]:
                     self.vision_config["audio"]["return_attention_mask"] = True
                 if "padding" not in self.vision_config["audio"]:
@@ -376,6 +433,7 @@ class MMEncoder:
                         self.vision_config["audio"]["padding"] = True
                 if "truncation" not in self.vision_config["audio"]:
                     # keep same logic as base_processor.py
+                    # 特定模型（Gemma3n、Qwen2Audio 等）不做截断
                     if (
                         hasattr(self, "audio_processor")
                         and self.audio_processor is not None
@@ -392,10 +450,12 @@ class MMEncoder:
         """
         Load image/video/audio processor separately,
         avoid issues with AutoProcessor not recognizing certain models
+        分别加载图像/视频/音频处理器，避免 AutoProcessor 对特殊模型的兼容问题
         """
         from transformers import AutoImageProcessor, AutoVideoProcessor
 
         try:
+            # 加载图像处理器（支持快速处理器）
             self.image_processor = AutoImageProcessor.from_pretrained(
                 server_args.tokenizer_path or server_args.model_path,
                 trust_remote_code=server_args.trust_remote_code,
@@ -407,6 +467,7 @@ class MMEncoder:
             self.image_processor = None
 
         try:
+            # 加载视频处理器（支持快速处理器）
             self.video_processor = AutoVideoProcessor.from_pretrained(
                 server_args.tokenizer_path or server_args.model_path,
                 trust_remote_code=server_args.trust_remote_code,
@@ -419,6 +480,7 @@ class MMEncoder:
 
         try:
             # Note: AutoProcessor is used for audio processor
+            # 使用 AutoProcessor 加载音频处理器（含 feature_extractor）
             _audio_proc = AutoProcessor.from_pretrained(
                 server_args.tokenizer_path or server_args.model_path,
                 trust_remote_code=server_args.trust_remote_code,
@@ -448,7 +510,10 @@ class MMEncoder:
         """
         Load a single multimodal data.
         If data is precomputed, returns directly.
-        Static method that can be pickled for multiprocessing"""
+        Static method that can be pickled for multiprocessing
+        加载单条多模态数据（图像/视频/音频），若已预处理则直接返回
+        """
+        # 若 data 已是字典（预计算数据），直接返回
         if isinstance(data, dict):
             return data
         try:
@@ -460,6 +525,7 @@ class MMEncoder:
                     and img.mode != "RGB"
                 ):
                     # Needed only when `img` is a PIL image
+                    # 丢弃 alpha 通道，转换为 RGB 模式
                     img = img.convert("RGB")
                 return img
             elif modality == Modality.VIDEO:
@@ -471,6 +537,7 @@ class MMEncoder:
             raise RuntimeError(f"Error while loading data {data}: {e}")
 
     def submit_data_loading_tasks(self, items, modalities):
+        # 向 I/O 线程池提交多条多模态数据加载任务，返回 Future 列表
         futures = []
         task_info = []
 
@@ -489,13 +556,16 @@ class MMEncoder:
     def _get_feat_extract_output_lengths(self, feature_lens):
         """
         Computes the output length of the convolutional layers and the output length of the audio encoder
+        计算音频编码器卷积层输出序列长度，不同模型（qwen2_audio、qwen3_asr 等）有不同的下采样公式
         """
         # qwen2_audio/qwen2.5_omni
         if self.model_type in ["qwen2_audio", "qwen2_5_omni"]:
+            # 两级下采样：先 /2 再 /2
             input_length = (feature_lens - 1) // 2 + 1
             return (input_length - 2) // 2 + 1
         # qwen3_asr / qwen3_omni_moe (same audio encoder architecture)
         elif self.model_type in ["qwen3_asr", "qwen3_omni_moe"]:
+            # 每 100 帧为一块，块内下采样两次，块间按 13 合并
             input_lengths_leave = feature_lens % 100
             feat_lengths = (input_lengths_leave - 1) // 2 + 1
             output_lengths = (
@@ -511,18 +581,21 @@ class MMEncoder:
             return (input_length - 2) // 2 + 1
 
     async def _flatten_and_load_videos(self, mm_items):
+        # 并发加载所有视频帧，并对 Qwen 系列模型做帧采样预处理
         if not isinstance(mm_items, (list, tuple)):
             mm_items = [mm_items]
 
         futures, _ = self.submit_data_loading_tasks(
             mm_items, [Modality.VIDEO] * len(mm_items)
         )
+        # 将线程 Future 包装为异步 Future 并发等待
         async_futures = [asyncio.wrap_future(f) for f in futures]
         video_items = await asyncio.gather(*async_futures)
 
         video_processor_kwargs = {}
         if "qwen" in self.model_type:
             # for qwen-series model, do sample frames before preprocess
+            # Qwen 系列模型需要在调用视频处理器前先对帧进行采样
             video_processed = [
                 await preprocess_video(
                     video, video_config=self.vision_config.get("video", {})
@@ -542,18 +615,22 @@ class MMEncoder:
     async def _flatten_and_load_data_by_modality(self, mm_items, modality):
         """
         Flatten mm_items structure, load multimodal data concurrently, and restore original structure.
+        将嵌套的多模态数据结构展平，并发加载后还原原始嵌套结构
 
         Returns:
             Same structure as load_mm_items would return, support for image/audio
         """
         # Handle single mm_item (not a list)
+        # 处理单个多模态项（非列表）
         if not isinstance(mm_items, (list, tuple)):
             futures, _ = self.submit_data_loading_tasks([mm_items], [modality])
             return await asyncio.wrap_future(futures[0])
 
         # Handle nested list (list of lists)
+        # 处理嵌套列表（多组多模态数据）
         if len(mm_items) > 0 and isinstance(mm_items[0], (list, tuple)):
             # Flatten nested structure
+            # 展平嵌套结构，记录每个元素所属的组索引
             flat_data = []
             flat_indices = []  # Track which group each item belongs to
             for group_idx, item_group in enumerate(mm_items):
@@ -562,15 +639,18 @@ class MMEncoder:
                     flat_indices.append(group_idx)
 
             # Submit all tasks concurrently
+            # 并发提交所有加载任务
             futures, _ = self.submit_data_loading_tasks(
                 flat_data, [modality] * len(flat_data)
             )
 
             # Wait for all tasks to complete asynchronously
+            # 异步等待所有加载任务完成
             async_futures = [asyncio.wrap_future(f) for f in futures]
             results = await asyncio.gather(*async_futures)
 
             # Restore nested structure
+            # 还原嵌套结构
             nested_results = [[] for _ in range(len(mm_items))]
             for idx, result in zip(flat_indices, results):
                 nested_results[idx].append(result)
@@ -578,6 +658,7 @@ class MMEncoder:
             return nested_results
 
         # Handle simple list
+        # 处理普通列表
         else:
             futures, _ = self.submit_data_loading_tasks(
                 mm_items, [modality] * len(mm_items)
@@ -589,14 +670,17 @@ class MMEncoder:
     def get_num_patches(
         self, grid: Union[torch.Tensor, List[int]], modality: Modality
     ) -> int:
-        """Calculate number of raw patches (before merge/sampling). Used for pixel_values slicing."""
+        """Calculate number of raw patches (before merge/sampling). Used for pixel_values slicing.
+        计算原始 patch 数量（合并/采样前），用于切分 pixel_values 张量"""
         if modality == Modality.AUDIO:
             return int(grid.item())
         else:
+            # 图像/视频：T * H * W 三维 grid
             return int(grid[0] * grid[1] * grid[2])
 
     def _kimi_tokens_from_patch_grid(self, grid: Union[torch.Tensor, List[int]]) -> int:
-        """MoonViT + tpool: output len is (h//mh)*(w//mw); temporal dim is pooled (not t*h*w/merge^2)."""
+        """MoonViT + tpool: output len is (h//mh)*(w//mw); temporal dim is pooled (not t*h*w/merge^2).
+        Kimi 模型的 token 数计算：时间维度已池化，仅按空间维度和合并核大小计算"""
         if isinstance(grid, torch.Tensor):
             flat = grid.flatten()
             _t, h, w = (int(x) for x in flat[:3].tolist())
@@ -608,23 +692,28 @@ class MMEncoder:
     def get_num_tokens(
         self, grid: Union[torch.Tensor, List[int]], modality: Modality
     ) -> int:
-        """Calculate number of tokens (after 2x2 merge). Used for mm_embedding slicing."""
+        """Calculate number of tokens (after 2x2 merge). Used for mm_embedding slicing.
+        计算合并后的 token 数量，用于切分最终 mm_embedding 张量"""
         if modality == Modality.AUDIO:
+            # 音频 token 数需经过卷积下采样公式计算
             input_length = self.get_num_patches(grid, modality)
             return self._get_feat_extract_output_lengths(input_length)
         else:
+            # Kimi 模型使用特殊的 token 计数方式
             if (
                 self.model_type in ["kimi_k25", "kimi_vl"]
                 and modality == Modality.IMAGE
             ):
                 return self._kimi_tokens_from_patch_grid(grid)
+            # 标准视觉模型：patch 数除以 merge_size^2（默认 2x2=4）
             merge_size = getattr(self.image_processor, "merge_size", 2)
             return self.get_num_patches(grid, modality) // (merge_size**2)
 
     def slice_embedding(
         self, mm_embedding: torch.Tensor, grid_thw: List, modality: Modality
     ) -> List[torch.Tensor]:
-        """Slice a concatenated embedding tensor into individual image embeddings."""
+        """Slice a concatenated embedding tensor into individual image embeddings.
+        将拼接的 embedding 张量按各图像的 token 数切分为独立 embedding 列表"""
         slices, offset = [], 0
         for grid in grid_thw:
             count = self.get_num_tokens(grid, modality)
@@ -635,7 +724,8 @@ class MMEncoder:
     def _calculate_hashes_from_features(
         self, mm_feature: torch.Tensor, grid_thw: List, modality: Modality
     ) -> List[str]:
-        """CPU Task: Compute hashes based on processed feature patches."""
+        """CPU Task: Compute hashes based on processed feature patches.
+        对每个多模态项的原始特征计算哈希值，用于全局缓存命中检测"""
         hashes, offset = [], 0
         logger.info(f"{mm_feature.shape=} with {modality=}")
         for grid in grid_thw:
@@ -657,10 +747,12 @@ class MMEncoder:
     ) -> List[torch.Tensor]:
         """
         GPU Task: Run ViT inference ONLY on the subset of mm items missing from the cache.
+        仅对缓存未命中的多模态项运行 ViT 推理（避免重复计算缓存命中的项）
         """
         grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
 
         # 1. Slice mm_feature to get only the patches for missing mm items
+        # 按 patch 偏移量计算各项的起止位置
         sub_feature_list = []
         offsets = [0]
         curr = 0
@@ -668,11 +760,13 @@ class MMEncoder:
             curr += self.get_num_patches(g, modality)
             offsets.append(curr)
 
+        # 提取仅缺失项的特征切片
         for idx in indices:
             sub_feature_list.append(mm_feature[offsets[idx] : offsets[idx + 1]])
 
         sub_feature = torch.cat(sub_feature_list, dim=0)
 
+        # 构建缺失项的 MultimodalDataItem
         mm_item = MultimodalDataItem.from_dict(
             {
                 "modality": modality,
@@ -680,20 +774,24 @@ class MMEncoder:
             }
         )
 
+        # 将其他辅助属性（grid、attention_mask 等）注入 mm_item
         for k, v in mm_inputs.items():
             if k in _mm_feature_attrs.get(modality, []):
                 continue
             val = _convert(v)
             if k in _mm_grid_attrs.get(modality, []):
+                # grid 属性需要按缺失索引切片
                 mm_item.set(k, val[indices])
             else:
                 mm_item.set(k, val)
 
+        # 在推理模式下运行 ViT，输出 embedding reshape 为 (tokens, hidden_dim)
         with torch.inference_mode():
             new_embeddings = get_feature_fn([mm_item]).cpu()
             if new_embeddings.ndim != 2:
                 new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
 
+        # 将合并的 embedding 按各缺失项的 token 数切分为列表
         sub_grids = [grid_thw[i] for i in indices]
         return self.slice_embedding(new_embeddings, sub_grids, modality)
 
@@ -706,6 +804,8 @@ class MMEncoder:
         part_idx: int,
         hashes: Optional[List[str]] = None,
     ) -> torch.Tensor:
+        # 使用全局多模态缓存进行编码：对缓存命中的项直接取出 embedding，
+        # 对缓存未命中的项运行 ViT 推理，最后拼接并存储到全局缓存
         # mm_inputs: dict
         mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
         grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
@@ -713,8 +813,10 @@ class MMEncoder:
         num_items = len(grid_thw)
 
         # Step 1: Rank 0 checks global cache and broadcasts hit/miss mask to all ranks.
+        # rank 0 检查全局缓存，生成命中/未命中掩码并广播给所有 rank
         if self.rank == 0:
             if hashes is None:
+                # 若未预先提供哈希值，从特征张量计算
                 mm_hashes = self._calculate_hashes_from_features(
                     mm_feature, grid_thw, modality
                 )
@@ -728,6 +830,7 @@ class MMEncoder:
             mm_hashes = None
             mask_tensor = torch.zeros(num_items, dtype=torch.int32)
 
+        # 多 rank 下通过 distributed broadcast 同步命中掩码
         if self.server_args.tp_size > 1:
             torch.distributed.broadcast(
                 mask_tensor,
@@ -740,6 +843,7 @@ class MMEncoder:
         hit_indices = [i for i, e in enumerate(exist_mask) if e]
 
         # Step 2: All ranks run ViT together on cache-miss images.
+        # 所有 rank 协同对缓存未命中的项运行 ViT 推理
         new_slices = []
         if missing_indices:
             new_slices = await self._encode_missing(
@@ -747,6 +851,7 @@ class MMEncoder:
             )
 
         # Step 3: Rank 0 prefetches cache-hit embeddings from global cache.
+        # rank 0 从全局缓存预取命中项的 embedding
         prefetch_status = torch.tensor([1], dtype=torch.int32)
 
         if self.rank == 0:
@@ -760,6 +865,7 @@ class MMEncoder:
                 try:
 
                     async def _wait_prefetch():
+                        # 轮询等待预取完成（间隔 5ms）
                         while not self.mm_global_cache.check_prefetch_progress(req_id):
                             await asyncio.sleep(0.005)
 
@@ -769,9 +875,11 @@ class MMEncoder:
                         f"Prefetch failed for req {req_id}: {e}. "
                         f"Falling back to ViT for {len(hit_indices)} hit items."
                     )
+                    # 预取失败，标记为 0，触发回退重新用 ViT 计算
                     prefetch_status[0] = 0
 
         # Step 4: Broadcast prefetch result to all ranks so they stay in sync.
+        # 广播预取状态，确保所有 rank 在同一状态下执行后续逻辑
         if self.server_args.tp_size > 1:
             torch.distributed.broadcast(
                 prefetch_status,
@@ -780,6 +888,7 @@ class MMEncoder:
             )
 
         # Step 5: If prefetch failed, all ranks fallback to ViT for the hit mm items.
+        # 预取失败时，所有 rank 对命中项重新运行 ViT 作为回退
         if prefetch_status.item() == 0 and hit_indices:
             logger.info(
                 f"Req {req_id}: Prefetch failed, all ranks running ViT fallback "
@@ -792,6 +901,7 @@ class MMEncoder:
             fallback_slices = None
 
         # Step 6: Rank 0 assembles final embedding and prepares for sending.
+        # rank 0 组装最终 embedding：将新计算的和从缓存读取的按原始顺序拼接
         if self.rank == 0:
             final_slices = [None] * num_items
 
@@ -799,6 +909,7 @@ class MMEncoder:
                 final_slices[idx] = new_slices[i]
 
             # Fill in cache-hit embeddings (from prefetch or fallback)
+            # 填入命中缓存的 embedding（预取成功时从缓存读取，失败时用回退计算结果）
             if prefetch_status.item() == 1 and hit_indices:
                 cached_slices = self.mm_global_cache.get_embeddings(
                     [mm_hashes[i] for i in hit_indices]
@@ -813,6 +924,7 @@ class MMEncoder:
 
             # Background insert: store newly computed embeddings into global cache.
             # Includes both original misses and fallback-recomputed hits.
+            # 后台异步将新计算的 embedding 插入全局缓存（含 miss 项和回退重算的 hit 项）
             all_new_hashes = [mm_hashes[i] for i in missing_indices]
             all_new_slices = list(new_slices)
             if fallback_slices is not None:
@@ -832,6 +944,7 @@ class MMEncoder:
                 self.background_tasks.add(task)
                 task.add_done_callback(self.background_tasks.discard)
 
+            # 构建辅助数据（视频时间戳等）并保存待发送的 EmbeddingData
             aux_data = _build_mm_aux_data(mm_inputs)
             self.embedding_to_send[req_id] = EmbeddingData(
                 req_id,
@@ -850,25 +963,30 @@ class MMEncoder:
                 None,
             )
         else:
+            # 非 rank 0 只参与分布式推理，不负责发送
             return (0, 0, 0, None, None)
 
     async def _flatten_and_load_audios(self, mm_items):
         """
         Flatten mm_items structure, load audios concurrently, and restore original structure.
+        并发加载音频数据，复用通用的展平/还原逻辑
         """
         return await self._flatten_and_load_data_by_modality(mm_items, Modality.AUDIO)
 
     async def _flatten_and_load_images(self, mm_items):
         """
         Flatten mm_items structure, load images concurrently, and restore original structure.
+        并发加载图像数据，复用通用的展平/还原逻辑
         """
         return await self._flatten_and_load_data_by_modality(mm_items, Modality.IMAGE)
 
     def _calculate_timestamps(self, indices, video_fps: float, merge_size: int = 2):
-        """Calculate timestamps for video frames, used for qwen3_vl models."""
+        """Calculate timestamps for video frames, used for qwen3_vl models.
+        计算视频帧的时间戳，供 Qwen3-VL 的旋转位置编码使用"""
         # refer to https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_vl/processing_qwen3_vl.py#L255
         if not isinstance(indices, list):
             indices = indices.tolist()
+        # 若帧数不是 merge_size 的整数倍，用最后一帧补齐
         if len(indices) % merge_size != 0:
             indices.extend(
                 indices[-1] for _ in range(merge_size - len(indices) % merge_size)
@@ -876,6 +994,7 @@ class MMEncoder:
         timestamps = [idx / video_fps for idx in indices]
         # Frames are merged by merge_size, so we need to average the timestamps
         # between the first/last frame within the temporal patch
+        # 对每个时间 patch 内的帧取首尾平均作为该 patch 的时间戳
         timestamps = [
             (timestamps[i] + timestamps[i + merge_size - 1]) / 2
             for i in range(0, len(timestamps), merge_size)
@@ -884,6 +1003,7 @@ class MMEncoder:
 
     @staticmethod
     def _flatten_nested_items(items):
+        # 递归展平嵌套列表，用于处理 Kimi 等模型的多层嵌套输入
         if not isinstance(items, (list, tuple)):
             return [items]
 
@@ -896,10 +1016,12 @@ class MMEncoder:
         return flat
 
     def _normalize_kimi_encoder_images(self, images):
-        """Normalize Kimi image inputs for the image processor call."""
+        """Normalize Kimi image inputs for the image processor call.
+        将 Kimi 系列模型的图像输入规范化为处理器所期望的格式（媒体字典列表）"""
         from PIL import Image as PILImage
 
         def wrap_one(img):
+            # 将单张图片包装为 Kimi K2.5 处理器要求的媒体字典格式
             if isinstance(img, dict) and img.get("type") in ("image", "video_chunk"):
                 return [img]
             if isinstance(img, PILImage.Image):
@@ -910,9 +1032,11 @@ class MMEncoder:
             return images
 
         # Disagg may supply nested lists from grouped routing.
+        # 分离架构可能传入嵌套列表，先展平
         images = self._flatten_nested_items(images)
 
         # Kimi-VL image processor expects a flat list of concrete images.
+        # Kimi-VL 处理器期望接收具体图片对象列表（非媒体字典）
         if self.model_type == "kimi_vl":
             normalized = []
             for img in images:
@@ -931,12 +1055,14 @@ class MMEncoder:
             return normalized
 
         # Kimi-K2.5 vision processor expects media dicts.
+        # Kimi-K2.5 视觉处理器期望接收媒体字典列表
         normalized = []
         for img in images:
             wrapped = wrap_one(img)
             for media in wrapped:
                 # Some pipelines may produce {"type": "image", "image": [PIL]}.
                 # Split it into one media item per concrete image object.
+                # 若 image 字段包含列表，拆分为多个独立媒体字典
                 if (
                     isinstance(media, dict)
                     and media.get("type") == "image"
@@ -950,7 +1076,9 @@ class MMEncoder:
         return normalized
 
     async def _process_mm_items(self, mm_items, modality):
+        # 根据模态调用对应的处理器，返回处理器输出字典和特征提取函数
         if modality == Modality.IMAGE and self.image_processor:
+            # 加载图像并调用图像处理器
             images = await self._flatten_and_load_images(mm_items)
             image_config = self.vision_config.get("image", {})
             if self.model_type in ["kimi_k25", "kimi_vl"]:
@@ -961,6 +1089,7 @@ class MMEncoder:
             else:
                 get_feature_method = self.model.get_image_feature
         elif modality == Modality.VIDEO and self.video_processor:
+            # 加载并采样视频帧，调用视频处理器
             videos, video_processor_kwargs = await self._flatten_and_load_videos(
                 mm_items
             )
@@ -968,6 +1097,7 @@ class MMEncoder:
                 videos=videos, **video_processor_kwargs
             )
             # Get additional video metadata
+            # 为 Qwen3-VL 系列模型计算视频时间戳（用于 RoPE）
             if (
                 self.model_type
                 in ["qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe"]
@@ -996,6 +1126,7 @@ class MMEncoder:
                 and processor_input.get("video_grid_thw", None) is not None
             ):
                 # For omni/qwen2_5_vl models, calculate second_per_grid_ts for rotary embedding
+                # 为 Qwen2.5-VL/Omni 计算每个视频 patch 对应的时间（秒）
                 video_grid_thw = processor_input["video_grid_thw"]
                 try:
                     temporal_patch_size = self.video_processor.temporal_patch_size
@@ -1016,15 +1147,18 @@ class MMEncoder:
             else:
                 get_feature_method = self.model.get_video_feature
         elif modality == Modality.AUDIO and self.audio_processor:
+            # 加载音频并调用特征提取器（feature_extractor）
             audios = await self._flatten_and_load_audios(mm_items)
             audio_config = self.vision_config.get("audio", {})
             processor_input = self.audio_processor.feature_extractor(
                 audios, **audio_config
             )
+            # 将 attention_mask 重命名为 feature_attention_mask 以匹配模型接口
             processor_input["feature_attention_mask"] = processor_input.pop(
                 "attention_mask"
             )
             # convert to same format as image/video
+            # 计算每条音频的有效帧长度，用于 token 数计算
             input_lengths = torch.tensor(
                 processor_input["feature_attention_mask"].sum(-1), dtype=torch.long
             )
@@ -1043,6 +1177,7 @@ class MMEncoder:
         return processor_input, get_feature_method
 
     async def _encode(self, mm_items, modality: Modality) -> torch.Tensor:
+        # 执行单次多模态编码：处理输入、可选缓存查找、ViT 推理、缓存写入
         try:
             mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
         except NotImplementedError as e:
@@ -1051,6 +1186,7 @@ class MMEncoder:
             raise BadRequestError(f"Failed to process mm items: {str(e)}")
         try:
             # support mm_cache
+            # 尝试从本地 prefix 缓存中查找已有 embedding，避免重复编码
             mm_embedding = None
             mm_hash = None
 
@@ -1060,6 +1196,7 @@ class MMEncoder:
                     "feature": _convert(_get_mm_feature(mm_inputs, modality)),
                 }
             )
+            # 将处理器输出的其他属性注入 mm_item（grid、attention_mask 等）
             for k, v in mm_inputs.items():
                 if k in _mm_feature_attrs[modality]:
                     continue
@@ -1069,11 +1206,13 @@ class MMEncoder:
                 mm_item.set_pad_value()
                 mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
                 async with self.mm_cache_lock:
+                    # 检查本地 embedding 缓存是否命中
                     mm_cache = self.mm_cache.get([mm_item.hash])
                     if mm_cache is not None:
                         mm_embedding = mm_cache.embedding
 
             if mm_embedding is None:
+                # 缓存未命中，运行 ViT 推理获取 embedding
                 with torch.inference_mode():
                     mm_embedding: torch.Tensor = get_feature_fn([mm_item])
                     mm_embedding = mm_embedding.cpu()
@@ -1081,6 +1220,7 @@ class MMEncoder:
                     mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
 
             if self.server_args.enable_prefix_mm_cache:
+                # 将新计算的 embedding 写入本地缓存
                 async with self.mm_cache_lock:
                     self.mm_cache.set(mm_hash, EmbeddingResult(embedding=mm_embedding))
             if self.profiler is not None:
@@ -1107,16 +1247,20 @@ class MMEncoder:
         embedding_port=None,
         url=None,
     ):
+        # 将编码结果发送到 Prefill 端：支持 Mooncake RDMA 传输和 ZMQ 消息传输两种方式
         if self.server_args.encoder_transfer_backend == "mooncake":
+            # Mooncake 传输：注册内存 -> RDMA 同步传输 -> 注销内存
             self.engine.register(embedding.data_ptr(), embedding.nbytes)
             self.engine.transfer_sync(
                 session_id, embedding.data_ptr(), buffer_address, embedding.nbytes
             )
             self.engine.deregister(embedding.data_ptr())
 
+            # Mooncake 传输完成后，清空 embedding 数据（已通过 RDMA 传输到 Decode 端）
             mm_data.embedding = None
 
         # Send ack/data
+        # 解析目标端点地址（URL 或 host+port 两种形式）
         if url is not None:
             endpoint = NetworkAddress.parse(url).to_tcp()
         else:
@@ -1124,10 +1268,13 @@ class MMEncoder:
         logger.info(f"{endpoint = }")
 
         # Serialize data
+        # 根据传输后端选择序列化方式
         if self.server_args.encoder_transfer_backend == "mooncake":
+            # Mooncake：embedding 已传输，只发送元数据
             serialized_data = pickle.dumps(mm_data)
             buffer = None
         else:
+            # ZMQ：分离元数据和 embedding 数据，使用零拷贝发送
             new_mm_data = mm_data.copy_without_embedding()
             if new_mm_data.error_msg is not None:
                 buffer = None
@@ -1138,12 +1285,15 @@ class MMEncoder:
                 buffer = embedding_tensor.__buffer__()
 
         # Use thread pool executor for parallel ZMQ send operations
+        # 在线程池中执行 ZMQ 发送（避免阻塞 asyncio 事件循环）
         def send_with_socket():
+            # 为每次发送创建新的 ZMQ PUSH socket（线程安全）
             sock = self.sync_context.socket(zmq.PUSH)
             config_socket(sock, zmq.PUSH)
             try:
                 sock.connect(endpoint)
                 if buffer is not None:
+                    # 多帧发送：元数据帧 + embedding 数据帧（零拷贝）
                     sock.send_multipart([serialized_data, buffer], copy=False)
                 else:
                     sock.send_multipart([serialized_data], copy=False)
@@ -1153,10 +1303,12 @@ class MMEncoder:
         await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
 
     async def encode(self, mm_items, modality: Modality, req_id, num_parts, part_idx):
+        # 对外暴露的编码入口：调用 _encode 并将结果包装为 EmbeddingData 保存
         try:
             grid_dim, mm_embedding, aux_data = await self._encode(mm_items, modality)
 
             if self.rank == 0:
+                # rank 0 创建 EmbeddingData 并保存，等待后续 send 调用发送
                 mm_data = EmbeddingData(
                     req_id,
                     num_parts,
@@ -1175,6 +1327,7 @@ class MMEncoder:
                 None,
             )
         except Exception as e:
+            # 编码失败时创建错误 EmbeddingData，供后续发送错误响应给 Prefill 端
             error_code = getattr(e, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
             error_msg = str(e)
             logger.error(f"Rank {self.rank} encode failed: {error_msg} {error_code = }")
@@ -1193,9 +1346,11 @@ class MMEncoder:
             return 0, 0, 0, error_msg, error_code
 
     # For zmq_to_tokenizer zmq_to_scheduler and mooncake
+    # 供 zmq_to_tokenizer/zmq_to_scheduler/mooncake 三种传输模式使用的发送接口
     async def send(
         self, req_id, prefill_host, embedding_port, session_id=None, buffer_address=None
     ):
+        # 从待发送字典中取出对应的 EmbeddingData 并发送
         mm_data: EmbeddingData = self.embedding_to_send[req_id]
         await self._send(
             mm_data.embedding,
@@ -1207,6 +1362,7 @@ class MMEncoder:
         )
 
     # For zmq_to_scheduler
+    # 供 zmq_to_scheduler 模式使用：等待 Decode 端注册接收 URL 后发送
     async def send_with_url(
         self,
         req_id,
@@ -1218,6 +1374,7 @@ class MMEncoder:
         all_tasks: List[Tuple[asyncio.Task, str]] = []
         start_time = asyncio.get_running_loop().time()
         timeout = self.send_timeout
+        # 获取或创建该请求的条件变量，用于等待新端点注册
         cond = await get_condition(req_id)
 
         try:
@@ -1226,6 +1383,7 @@ class MMEncoder:
                     current_targets = rid_to_receive_endpoint.get(req_id, set()).copy()
                     expected_count = rid_to_receive_count.get(req_id)
 
+                # 找到尚未发送的新端点
                 new_targets = current_targets - sent_urls
 
                 if new_targets:
@@ -1233,6 +1391,7 @@ class MMEncoder:
                         f"Found {len(new_targets)} new endpoints for {req_id}. Starting tasks..."
                     )
                     for url in new_targets:
+                        # 为每个新端点异步发送 embedding
                         task = asyncio.create_task(
                             self._send(
                                 mm_data.embedding,
@@ -1242,6 +1401,7 @@ class MMEncoder:
                         )
                         all_tasks.append((task, url))
                         sent_urls.add(url)  # Mark as handled immediately
+                # 已发送给所有期望的端点，退出循环
                 if expected_count is not None and len(sent_urls) >= expected_count:
                     logger.info(
                         f"All {expected_count} endpoints initiated for {req_id}. Breaking loop."
@@ -1254,6 +1414,7 @@ class MMEncoder:
                     )
                     break
 
+                # 等待新端点注册的通知（有超时保护）
                 async with cond:
                     try:
                         await asyncio.wait_for(cond.wait(), timeout=remaining)
@@ -1265,6 +1426,7 @@ class MMEncoder:
                     f"Loop finished. Awaiting completion of {len(all_tasks)} sending tasks..."
                 )
                 tasks_only = [t[0] for t in all_tasks]
+                # 等待所有发送任务完成，收集异常
                 results = await asyncio.gather(*tasks_only, return_exceptions=True)
 
                 # Process results and log errors
@@ -1278,6 +1440,7 @@ class MMEncoder:
             logger.info(f"All tasks completed for req_id: {req_id}")
 
         finally:
+            # 清理该请求的所有状态数据
             logger.info(f"Cleaning up resources for req_id {req_id}")
             async with rid_lock:
                 rid_to_receive_endpoint.pop(req_id, None)
@@ -1287,6 +1450,7 @@ class MMEncoder:
             self.embedding_to_send.pop(req_id, None)
 
     async def get_embedding_port(self, prefill_url):
+        # 向 Prefill 端查询 embedding 接收端口（用于动态协商）
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=1800)
         ) as session:
@@ -1299,6 +1463,7 @@ class MMEncoder:
 
 
 class EncoderProfiler:
+    # 编码器性能剖析器：支持按步骤自动停止的 PyTorch Profiler 封装
     def __init__(self, rank: int):
         self.rank = rank
         self.profiler = None
@@ -1308,6 +1473,7 @@ class EncoderProfiler:
         self.profile_id = None
 
     def start(self, obj: ProfileReq):
+        # 启动 Profiler：创建 torch.profiler.profile 实例并开始采集
         if self.profiler is not None:
             return False, "profiling already running"
 
@@ -1328,6 +1494,7 @@ class EncoderProfiler:
         if not torch_activities and not profile_memory:
             return False, "no supported activities"
 
+        # 配置并启动 PyTorch Profiler
         self.profiler = torch.profiler.profile(
             activities=torch_activities,
             with_stack=True if obj.with_stack is None else obj.with_stack,
@@ -1342,6 +1509,7 @@ class EncoderProfiler:
         return True, None
 
     def step(self):
+        # 每次编码后推进 Profiler 一步，达到步数上限时自动停止
         if self.profiler is None:
             return
         self.profiler.step()
@@ -1351,6 +1519,7 @@ class EncoderProfiler:
                 self.stop()
 
     def stop(self):
+        # 停止 Profiler 并将 Chrome Trace 导出到文件
         if self.profiler is None:
             return False, "profiling not running"
         self.profiler.stop()
@@ -1363,18 +1532,23 @@ class EncoderProfiler:
         return True, None
 
 
+# FastAPI 应用实例，提供编码服务的 HTTP 接口
 app = FastAPI()
+# 全局编码器实例（rank 0 使用）
 encoder: Optional[MMEncoder] = None
+# 向非 rank 0 进程发送请求的 ZMQ PUSH socket 列表
 send_sockets: List[zmq.Socket] = []
 
 
 async def run_encoder(
     server_args: ServerArgs, schedule_path, dist_init_method, rank: int
 ):
+    # 非 rank 0 进程的异步主循环：通过 ZMQ PULL socket 接收并处理编码请求
     encoder = MMEncoder(server_args, schedule_path, dist_init_method, rank)
     while True:
         request = await encoder.schedule_socket.recv_pyobj()
         if isinstance(request, ProfileReq):
+            # 处理 Profiler 控制请求（启动/停止）
             if request.type == ProfileReqType.START_PROFILE:
                 if encoder.profiler is None:
                     encoder.profiler = EncoderProfiler(encoder.rank)
@@ -1382,6 +1556,7 @@ async def run_encoder(
             else:
                 encoder.profiler.stop()
         else:
+            # 处理普通编码请求（转发自 rank 0 的 HTTP 请求）
             if encoder.mm_global_cache is not None:
                 await encoder.encode_with_global_cache(
                     mm_items=request["mm_items"],
@@ -1402,6 +1577,7 @@ async def run_encoder(
 
 
 def launch_encoder(server_args, schedule_path, dist_init_method, rank):
+    # 在子进程中启动非 rank 0 的编码器（通过 asyncio.run 运行异步主循环）
     try:
         asyncio.run(run_encoder(server_args, schedule_path, dist_init_method, rank))
     except KeyboardInterrupt:
@@ -1411,11 +1587,13 @@ def launch_encoder(server_args, schedule_path, dist_init_method, rank):
 
 
 def launch_server(server_args: ServerArgs):
+    # 服务器启动入口：创建各 rank 的编码器子进程，rank 0 作为主进程运行 FastAPI 服务
     global encoder
     ctx = mp.get_context("spawn")
     zmq_ctx = zmq.Context(10)
     ipc_path_prefix = random_uuid()
     port_args = PortArgs.init_new(server_args)
+    # 解析分布式初始化地址
     if server_args.dist_init_addr:
         na = NetworkAddress.parse(server_args.dist_init_addr)
         dist_init_method = na.to_tcp()
@@ -1423,6 +1601,7 @@ def launch_server(server_args: ServerArgs):
         dist_init_method = NetworkAddress(
             server_args.host or "127.0.0.1", port_args.nccl_port
         ).to_tcp()
+    # 为每个非 rank 0 的 TP rank 创建子进程和对应的 IPC ZMQ socket
     for rank in range(1, server_args.tp_size):
         schedule_path = f"ipc:///tmp/{ipc_path_prefix}_schedule_{rank}"
         send_sockets.append(
@@ -1433,11 +1612,13 @@ def launch_server(server_args: ServerArgs):
             args=(server_args, schedule_path, dist_init_method, rank),
             daemon=True,
         ).start()
+    # rank 0 直接在主进程中创建编码器并启动 uvicorn HTTP 服务
     encoder = MMEncoder(server_args, dist_init_method=dist_init_method)
     uvicorn.run(app, host=server_args.host, port=server_args.port)
 
 
 async def get_condition(rid):
+    # 获取或创建指定请求 ID 的异步条件变量（线程安全）
     async with cond_dict_lock:
         if rid not in rid_to_cond:
             rid_to_cond[rid] = asyncio.Condition()
@@ -1446,15 +1627,18 @@ async def get_condition(rid):
 
 @app.post("/encode")
 async def handle_encode_request(request: dict):
+    # HTTP 编码请求处理器：广播到所有 TP rank，执行编码，按传输后端发送 embedding
     req_id = request["req_id"]
     try:
 
         def start_background_send(req_id):
+            # 在后台异步发送 embedding（不阻塞当前请求响应）
             task = asyncio.create_task(encoder.send_with_url(req_id=req_id))
             encoder.background_tasks.add(task)
             task.add_done_callback(encoder.background_tasks.discard)
 
         # broadcast request
+        # 将编码请求广播给所有非 rank 0 的 TP 进程，确保分布式推理同步
         request.update({"enter_time": time.time()})
         for socket in send_sockets:
             socket.send_pyobj(request)
@@ -1481,6 +1665,7 @@ async def handle_encode_request(request: dict):
             )
 
         if error_msg:
+            # 编码出错时，仍需将错误信息发送到 Prefill 端
             if encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
                 if request["embedding_port"] is None:
                     start_background_send(req_id)
@@ -1496,6 +1681,7 @@ async def handle_encode_request(request: dict):
                 content={"status": "error", "message": error_msg, "req_id": req_id},
             )
         if encoder.server_args.encoder_transfer_backend == "mooncake":
+            # Mooncake 传输：返回 embedding 元数据（大小、形状），实际数据通过 RDMA 传输
             del request["mm_items"]
             request.update(
                 {
@@ -1506,13 +1692,16 @@ async def handle_encode_request(request: dict):
             )
             return ORJSONResponse(content=request)
         elif encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
+            # ZMQ 调度器模式：通过 ZMQ 将 embedding 发送到调度器指定的端口
             logger.info(f"{request['embedding_port'] = }")
             if request["embedding_port"] is None:
+                # 动态端口模式：等待调度器注册接收 URL
                 await encoder.send_with_url(
                     req_id=request["req_id"],
                 )
             else:
                 assert type(request["embedding_port"]) == list
+                # 静态端口模式：向指定端口列表并发发送
                 tasks = []
                 for embedding_port in request["embedding_port"]:
                     tasks.append(
@@ -1526,6 +1715,7 @@ async def handle_encode_request(request: dict):
                 encoder.embedding_to_send.pop(request["req_id"], None)
             return ORJSONResponse(content=None)
         elif encoder.server_args.encoder_transfer_backend == "zmq_to_tokenizer":
+            # ZMQ Tokenizer 模式：直接发送到 Tokenizer 指定端口
             await encoder.send(
                 req_id=request["req_id"],
                 prefill_host=request["prefill_host"],
@@ -1550,6 +1740,7 @@ async def handle_encode_request(request: dict):
 @app.post("/send")
 async def handle_send_request(request: dict):
     # mooncake backend
+    # Mooncake 传输后端专用接口：RDMA 传输完成后发送确认消息
     await encoder.send(
         req_id=request["req_id"],
         prefill_host=request["prefill_host"],
@@ -1563,6 +1754,8 @@ async def handle_send_request(request: dict):
 
 @app.post("/scheduler_receive_url")
 async def handle_scheduler_receive_url_request(request: dict):
+    # 调度器注册接收 URL 接口：Decode 端告知编码器自己的接收地址
+    # 编码器据此知道应将 embedding 发往何处
     rid = request["req_id"]
     async with rid_lock:
         global rid_to_receive_endpoint
@@ -1571,6 +1764,7 @@ async def handle_scheduler_receive_url_request(request: dict):
             rid_to_receive_count[rid] = request["receive_count"]
         assert rid_to_receive_count[rid] == request["receive_count"]
         rid_to_receive_endpoint[rid].add(request["receive_url"])
+    # 通知等待新端点的 send_with_url 协程
     cond = await get_condition(rid)
     async with cond:
         cond.notify_all()
@@ -1583,6 +1777,7 @@ async def health_generate():
     Health check endpoint for the encoder server.
     Performs a dummy encode to verify the encoder is functional.
     Returns 200 if the encoder is healthy, 503 otherwise.
+    编码器健康检查：通过执行一次虚拟编码验证编码器功能是否正常
     """
     if encoder is None:
         return Response(status_code=503)
@@ -1590,10 +1785,12 @@ async def health_generate():
     # Skip the dummy encode when real requests are already in flight — the
     # ongoing traffic already proves liveness, matching the scheduler's
     # `is_fully_idle`-based health-check skip pattern.
+    # 若有真实请求正在处理中，跳过虚拟编码直接返回健康（避免资源竞争）
     if encoder.embedding_to_send:
         return Response(status_code=200)
 
     # Pick the first available modality for the dummy encode
+    # 选择第一个可用的模态进行虚拟编码
     if encoder.image_processor is not None:
         mm_items = [f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"]
         modality = Modality.IMAGE
@@ -1616,10 +1813,12 @@ async def health_generate():
         }
 
         # Broadcast to other TP ranks so distributed ops stay in sync
+        # 广播给其他 TP rank 确保分布式操作同步
         for socket in send_sockets:
             socket.send_pyobj(dummy_request)
 
         # Run encode on rank 0 with timeout
+        # 在 rank 0 上执行编码，设置超时时间
         _, _, _, error_msg, _ = await asyncio.wait_for(
             encoder.encode(
                 mm_items=mm_items,
@@ -1632,6 +1831,7 @@ async def health_generate():
         )
 
         # Clean up stored embedding
+        # 清理健康检查产生的临时 embedding
         encoder.embedding_to_send.pop(req_id, None)
 
         if error_msg:
@@ -1650,6 +1850,7 @@ async def health_generate():
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
 async def start_profile_async(obj: Optional[ProfileReqInput] = None):
+    # 启动性能剖析接口：支持 GET/POST，可配置剖析参数
     if encoder is None:
         return Response(content="encoder not ready\n", status_code=503)
     req = None
@@ -1670,6 +1871,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
             profile_prefix=obj.profile_prefix,
             profile_stages=obj.profile_stages,
         )
+    # 广播给所有 TP rank 同步启动 Profiler
     for socket in send_sockets:
         socket.send_pyobj(req)
     if encoder.profiler is None:
@@ -1688,6 +1890,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
 
 @app.api_route("/stop_profile", methods=["GET", "POST"])
 async def stop_profile_async():
+    # 停止性能剖析接口：广播停止命令并保存 trace 文件
     if encoder is None:
         return Response(content="encoder not ready\n", status_code=503)
     if encoder.profiler is None:
@@ -1695,6 +1898,7 @@ async def stop_profile_async():
             content="profiling not initialized\n", status_code=HTTPStatus.BAD_REQUEST
         )
     req = ProfileReq(ProfileReqType.STOP_PROFILE)
+    # 广播给所有 TP rank 同步停止 Profiler
     for socket in send_sockets:
         socket.send_pyobj(req)
     ok, msg = encoder.profiler.stop()

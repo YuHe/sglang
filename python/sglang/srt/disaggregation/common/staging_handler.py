@@ -5,6 +5,9 @@ Isolates staging scatter lifecycle from decode.py and conn.py.
 Generic (backend-agnostic) code is at the top; mooncake-specific
 protocol code is at the bottom.
 """
+# staging 处理器：用于异构 TP（Tensor Parallelism）场景下的 KV 缓存传输
+# 当 prefill 侧 TP > decode 侧 TP 时，需要先将 KV 传输到 staging 缓冲区，
+# 再由 decode 侧的 scatter 操作将数据重新排布到正确的 KV 缓存位置
 
 from __future__ import annotations
 
@@ -27,28 +30,32 @@ if TYPE_CHECKING:
 # ======================================================================
 
 
+# decode 侧 staging 上下文：存储 staging 分配器及 room-receiver/bootstrap 映射
 @dataclasses.dataclass
 class DecodeStagingContext:
     """Staging-specific context for decode mode."""
 
-    allocator: object = None
-    room_bootstrap: dict = dataclasses.field(default_factory=dict)
-    room_receivers: dict = dataclasses.field(default_factory=dict)
+    allocator: object = None                              # staging 环形缓冲区分配器
+    room_bootstrap: dict = dataclasses.field(default_factory=dict)   # room -> bootstrap 信息
+    room_receivers: dict = dataclasses.field(default_factory=dict)   # room -> KV 接收器
 
 
+# prefill 侧 staging 上下文：存储 staging 缓冲区列表、远端水印和预取 socket
 @dataclasses.dataclass
 class PrefillStagingContext:
     """Staging-specific context for prefill mode."""
 
-    buffers: list = dataclasses.field(default_factory=list)
-    remote_watermarks: dict = dataclasses.field(default_factory=dict)
+    buffers: list = dataclasses.field(default_factory=list)           # prefill 侧 staging 缓冲区列表
+    remote_watermarks: dict = dataclasses.field(default_factory=dict) # session_id -> (round, tail) 水印
     watermark_cv: threading.Condition = dataclasses.field(
         default_factory=threading.Condition
-    )
-    prefetch_requested: set = dataclasses.field(default_factory=set)
-    prefetch_sockets: dict = dataclasses.field(default_factory=dict)
+    )  # 水印更新条件变量，用于等待 decode 端水印推进
+    prefetch_requested: set = dataclasses.field(default_factory=set)  # 已发送 STAGING_REQ 的 (room, chunk, session) 集合
+    prefetch_sockets: dict = dataclasses.field(default_factory=dict)  # endpoint -> ZMQ PUSH socket
 
 
+# decode 侧 staging scatter 生命周期管理器
+# scatter 提交可以在 decode_thread（后台）中执行，事件检查和内存释放在调度器主线程执行
 class DecodeStagingHandler:
     """Decode-side staging scatter lifecycle manager.
 
@@ -68,17 +75,18 @@ class DecodeStagingHandler:
         scheduler,
     ):
         self.kv_manager = kv_manager
-        self.staging_allocator = staging_allocator
-        self.kv_buffer_info = kv_buffer_info
-        self.decode_tp = decode_tp
-        self.total_kv_heads = total_kv_heads
-        self.tp_rank = tp_rank
+        self.staging_allocator = staging_allocator     # staging 环形缓冲区分配器
+        self.kv_buffer_info = kv_buffer_info           # KV 缓冲区张量信息（k/v buffers, page_size）
+        self.decode_tp = decode_tp                     # decode 侧 TP 大小
+        self.total_kv_heads = total_kv_heads           # 模型 KV head 总数
+        self.tp_rank = tp_rank                         # 当前 TP rank
         self.scheduler = scheduler
-        self._room_to_decode_req: dict = {}
-        self._wm_subscribers: dict = {}
+        self._room_to_decode_req: dict = {}            # room -> decode 请求的映射
+        self._wm_subscribers: dict = {}               # key -> (receiver, session_id) 水印订阅者
 
     def register_wm_subscriber(self, receiver, session_id: str) -> None:
         """Register a prefill's bootstrap connection for watermark broadcasts."""
+        # 注册 prefill 端的 bootstrap 连接，以便在 staging 释放后广播水印
         if receiver is None or not getattr(receiver, "bootstrap_infos", None):
             return
         key = tuple(str(bi) for bi in receiver.bootstrap_infos)
@@ -87,6 +95,7 @@ class DecodeStagingHandler:
 
     def num_writers_for(self, decode_req) -> int:
         """Compute num_writers for a specific request based on its prefill TP."""
+        # 计算当前请求的写入者数量：prefill_tp > decode_tp 时，每个 decode rank 需等待多个 prefill rank
         prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
         if prefill_tp > self.decode_tp:
             return prefill_tp // max(1, self.decode_tp)
@@ -95,6 +104,7 @@ class DecodeStagingHandler:
     @classmethod
     def create(cls, kv_manager, scheduler, tp_rank: int) -> "DecodeStagingHandler":
         """Factory: create handler. Raises if staging infra is missing."""
+        # 工厂方法：从 kv_manager 中提取 staging 分配器和 KV 缓冲区信息，创建 handler
         staging_allocator = kv_manager._staging_ctx.allocator
         if staging_allocator is None:
             raise RuntimeError(
@@ -129,9 +139,11 @@ class DecodeStagingHandler:
     # ------------------------------------------------------------------
 
     def register_decode_req(self, room: int, decode_req: "DecodeRequest") -> None:
+        # 注册请求的 room -> decode_req 映射，供后台线程查找
         self._room_to_decode_req[room] = decode_req
 
     def unregister_decode_req(self, room: int) -> None:
+        # 请求完成或失败后注销映射
         self._room_to_decode_req.pop(room, None)
 
     # ------------------------------------------------------------------
@@ -146,6 +158,8 @@ class DecodeStagingHandler:
         Called from decode_thread.  Records a CUDA event on decode_req so
         the main thread can later check completion and free the allocation.
         """
+        # 当某个中间 chunk 的所有写入者都已到达时，提交 scatter 操作
+        # 在 decode_thread 中调用，通过 CUDA Event 记录完成时间供主线程检查
         decode_req = self._room_to_decode_req.get(room)
         if decode_req is None:
             logger.warning(
@@ -165,11 +179,13 @@ class DecodeStagingHandler:
 
         ok = self._scatter_region(staging_offset, page_start, num_pages, decode_req)
         if ok:
+            # 记录 CUDA Event 供主线程轮询，事件触发后可释放 staging 内存
             event = torch.cuda.Event()
             event.record(self.staging_allocator._scatter_stream)
             if not hasattr(decode_req, "_chunk_events"):
                 decode_req._chunk_events = []
             decode_req._chunk_events.append((event, alloc_id))
+            # 将 chunk_info 标记为已处理（alloc_id/offset 置 -1）
             chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
         else:
             logger.warning(
@@ -182,6 +198,7 @@ class DecodeStagingHandler:
 
     def is_staging_room(self, room: int) -> bool:
         """Check if a room is registered for staging scatter."""
+        # 判断 room 是否在 staging scatter 注册表中
         return room in self._room_to_decode_req
 
     def submit_last_scatter_async(self, room: int) -> bool:
@@ -191,6 +208,8 @@ class DecodeStagingHandler:
         ``_staging_last_scatter_submitted`` so the main thread sees the
         event when it checks the flag (CPython GIL guarantees ordering).
         """
+        # 所有 TP rank 报告 Success 后，提交最后一个 chunk 的 scatter
+        # 先设 _scatter_event 再设 _staging_last_scatter_submitted，利用 GIL 保证可见性顺序
         decode_req = self._room_to_decode_req.get(room)
         if decode_req is None:
             logger.warning(
@@ -202,12 +221,14 @@ class DecodeStagingHandler:
             return False
         alloc_id = self._submit_last_scatter(decode_req)
         if alloc_id >= 0:
+            # scatter 已提交：记录完成事件
             event = torch.cuda.Event()
             event.record(self.staging_allocator._scatter_stream)
             decode_req._scatter_event = event
             decode_req._scatter_alloc_id = alloc_id
             decode_req._staging_last_scatter_submitted = True
         else:
+            # 无需 scatter（已直接完成）
             decode_req._staging_scatter_done = True
         return True
 
@@ -217,6 +238,7 @@ class DecodeStagingHandler:
 
     def is_done(self, decode_req: "DecodeRequest") -> bool:
         """Return True if staging scatter is complete for this request."""
+        # 检查该请求的 staging scatter 是否全部完成（包括中间 chunks 和最后一个 chunk）
         if not getattr(decode_req, "_staging_scatter_done", False):
             return False
         return not getattr(decode_req, "_chunk_events", None)
@@ -228,9 +250,11 @@ class DecodeStagingHandler:
         (via submit_chunk_scatter / submit_last_scatter_async).  This
         method only polls the recorded events and releases staging memory.
         """
+        # 轮询 CUDA Events：仅检查事件完成状态并释放 staging 内存，不提交新 GPU 工作
         room = decode_req.req.bootstrap_room
         chunk_events = getattr(decode_req, "_chunk_events", None)
         if chunk_events:
+            # 倒序遍历以安全地 pop 已完成的事件
             for i in range(len(chunk_events) - 1, -1, -1):
                 event, alloc_id = chunk_events[i]
                 if event.query():
@@ -240,6 +264,7 @@ class DecodeStagingHandler:
         if not getattr(decode_req, "_staging_last_scatter_submitted", False):
             return
 
+        # 检查最后一个 chunk 的 scatter 事件
         event = getattr(decode_req, "_scatter_event", None)
         if event is not None and event.query():
             self._free_and_send_watermark(decode_req._scatter_alloc_id, decode_req)
@@ -264,6 +289,8 @@ class DecodeStagingHandler:
         runs on scatter_stream so that the decode_thread never blocks on
         the default stream (which carries the main-thread forward pass).
         """
+        # 在 scatter_stream 上提交 GPU scatter 内核，将 staging 中的数据分散到 KV 缓存
+        # 在后台线程执行，避免阻塞主线程的 forward pass
         from sglang.srt.disaggregation.common.staging_buffer import (
             scatter_staging_to_kv,
         )
@@ -271,16 +298,19 @@ class DecodeStagingHandler:
         k_buffers = self.kv_buffer_info["k_buffers"]
         v_buffers = self.kv_buffer_info["v_buffers"]
         page_size = self.kv_buffer_info["page_size"]
+        # dst_tp_rank: 当前 engine rank 在 decode TP 组内的位置
         dst_tp_rank = self.kv_manager.kv_args.engine_rank % self.decode_tp
 
         device = k_buffers[0].device
         torch.cuda.set_device(device)
 
+        # 懒惰创建 scatter_stream（避免在构造时创建不必要的 CUDA 资源）
         if not hasattr(self.staging_allocator, "_scatter_stream"):
             self.staging_allocator._scatter_stream = torch.cuda.Stream(device=device)
 
         scatter_stream = self.staging_allocator._scatter_stream
 
+        # staging 缓冲区视图：从 staging_offset 开始的连续内存
         staging_view = self.staging_allocator.buffer.buffer[staging_offset:]
 
         req_pool_idx = decode_req.req.req_pool_idx
@@ -289,14 +319,17 @@ class DecodeStagingHandler:
         prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
 
         with torch.cuda.stream(scatter_stream):
+            # 获取目标 token 范围的 KV 索引
             kv_indices = self.scheduler.req_to_token_pool.req_to_token[
                 req_pool_idx, token_start:token_end
             ]
+            # 将 token 级索引转换为 page 级索引
             if page_size > 1:
                 page_idx_tensor = kv_indices[::page_size] // page_size
             else:
                 page_idx_tensor = kv_indices
 
+            # 执行 staging -> KV 缓存的 scatter 操作（重排 head 布局）
             scatter_staging_to_kv(
                 staging_view,
                 k_buffers,
@@ -313,6 +346,7 @@ class DecodeStagingHandler:
 
     def _submit_last_scatter(self, decode_req: "DecodeRequest") -> int:
         """Submit scatter for the last chunk. Returns alloc_id >= 0, or -1."""
+        # 提交最后一个 chunk 的 scatter，返回 alloc_id（-1 表示无需 scatter 或失败）
         receiver = decode_req.kv_receiver
         chunk_infos = getattr(receiver, "chunk_staging_infos", [])
         if not chunk_infos:
@@ -323,6 +357,7 @@ class DecodeStagingHandler:
         if staging_offset < 0 or alloc_id < 0:
             return -1
 
+        # 计算最后一个 chunk 的起始 page（总 page 数 - 最后 chunk page 数）
         seq_len = len(decode_req.req.origin_input_ids)
         ps = self.scheduler.token_to_kv_pool_allocator.page_size
         total_pages = (seq_len + ps - 1) // ps
@@ -337,12 +372,15 @@ class DecodeStagingHandler:
         self, alloc_id: int, decode_req: "DecodeRequest"
     ) -> None:
         """Free a staging allocation and broadcast watermark to all prefills."""
+        # 释放 staging 分配并向所有订阅的 prefill 端广播新水印
+        # 水印告知 prefill 端哪些 staging 空间已可复用
         self.staging_allocator.free(alloc_id)
         post_wm = self.staging_allocator.get_watermark()
         room = decode_req.req.bootstrap_room
         wm_round, wm_tail = post_wm
         wm_round_b = str(wm_round).encode("ascii")
         wm_tail_b = str(wm_tail).encode("ascii")
+        # 向所有注册的 prefill bootstrap 连接发送 WATERMARK 消息
         for _key, (receiver, session_id) in list(self._wm_subscribers.items()):
             sid_b = session_id.encode("ascii")
             for bootstrap_info in receiver.bootstrap_infos:
@@ -360,10 +398,14 @@ def is_watermark_ready(
     staging_state, session_id: str, alloc_round: int, alloc_end: int
 ) -> bool:
     """Non-blocking check: is the staging region safe to write?"""
+    # 非阻塞检查：staging 区域的水印是否已推进到允许写入的位置
+    # alloc_round <= 0 表示第一轮分配，无需等待水印
     if alloc_round <= 0:
         return True
     prev_round = alloc_round - 1
+    # 从 remote_watermarks 获取 decode 端最新水印 (round, tail)
     wm_round, wm_tail = staging_state.remote_watermarks.get(session_id, (0, 0))
+    # 水印就绪条件：上一轮已完全完成，或本轮水印 tail >= alloc_end
     return prev_round < wm_round or (prev_round == wm_round and alloc_end <= wm_tail)
 
 
@@ -372,15 +414,17 @@ def is_watermark_ready(
 # ======================================================================
 
 
+# StagingTransferInfo：记录每个请求各 chunk 的 staging 分配信息（offset/round/end）
 @dataclasses.dataclass
 class StagingTransferInfo:
     """Per-chunk staging allocation info attached to a TransferInfo."""
 
-    offsets: List[int] = dataclasses.field(default_factory=lambda: [-1])
-    rounds: List[int] = dataclasses.field(default_factory=lambda: [0])
-    ends: List[int] = dataclasses.field(default_factory=lambda: [-1])
+    offsets: List[int] = dataclasses.field(default_factory=lambda: [-1])   # 每个 chunk 的 staging buffer 偏移量
+    rounds: List[int] = dataclasses.field(default_factory=lambda: [0])     # 每个 chunk 对应的分配轮次
+    ends: List[int] = dataclasses.field(default_factory=lambda: [-1])      # 每个 chunk 的分配结束位置
 
     def set_chunk(self, idx: int, offset: int, rnd: int, end: int):
+        # 设置或扩展指定 chunk 索引的分配信息
         while len(self.offsets) <= idx:
             self.offsets.append(-1)
             self.rounds.append(0)
@@ -390,17 +434,19 @@ class StagingTransferInfo:
         self.ends[idx] = end
 
 
+# StagingRegisterInfo：staging 缓冲区的注册信息（基址和总大小），通过 ZMQ 消息传递
 @dataclasses.dataclass
 class StagingRegisterInfo:
     """Staging buffer registration info attached to a KVArgsRegisterInfo."""
 
-    base_ptr: int = 0
-    total_size: int = 0
+    base_ptr: int = 0      # staging 缓冲区的基地址指针（uint64）
+    total_size: int = 0    # staging 缓冲区总字节大小
 
     @classmethod
     def from_zmq_fields(
         cls, msg: list, msg_start_offset: int
     ) -> Optional["StagingRegisterInfo"]:
+        # 从 ZMQ 多帧消息中解析 staging 注册信息
         i = msg_start_offset
         base_ptr = (
             struct.unpack("Q", msg[i])[0] if len(msg) > i and len(msg[i]) == 8 else 0
@@ -415,6 +461,8 @@ class StagingRegisterInfo:
         return cls(base_ptr=base_ptr, total_size=total_size)
 
 
+# PrefillStagingStrategy：prefill 侧 staging 传输策略
+# 封装 chunk 索引计算、staging offset 查找、水印就绪检查，并代理实际 RDMA 传输
 class PrefillStagingStrategy:
     """Prefill-side staging transfer: readiness check + gather-RDMA execution.
 
@@ -426,6 +474,7 @@ class PrefillStagingStrategy:
         self.kv_manager = kv_manager
         self.staging_buffer = staging_buffer
         page_size = kv_manager.kv_buffer_tensors["page_size"]
+        # full_chunk_pages：完整 chunk 的 page 数量（由 chunked_prefill_size 决定）
         cps = kv_manager.server_args.chunked_prefill_size or 8192
         self.full_chunk_pages = max(1, cps // page_size)
 
@@ -441,8 +490,13 @@ class PrefillStagingStrategy:
         offset == ALLOC_OVERSIZED means permanent failure (fall back to slice).
         offset == -1 means allocation pending (re-enqueue).
         """
+        # 检查当前 chunk 的 staging 分配和水印是否就绪
+        # 返回 (ready, chunk_idx, offset, round, end)
+        # offset == ALLOC_OVERSIZED: 永久失败，回退到切片传输
+        # offset == -1: 分配待定，需要重新入队
         from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
 
+        # 根据全局 chunk page 索引计算 chunk_idx
         chunk_idx = (
             kv_chunk_index_start // self.full_chunk_pages
             if self.full_chunk_pages > 0
@@ -462,6 +516,7 @@ class PrefillStagingStrategy:
         c_round = stg.rounds[chunk_idx]
         c_end = stg.ends[chunk_idx]
 
+        # 检查 decode 端水印是否已推进到允许写入的位置
         if not self.kv_manager._is_watermark_ready(
             req.mooncake_session_id, c_round, c_end
         ):
@@ -481,6 +536,7 @@ class PrefillStagingStrategy:
 
         Returns 0 on success, -1 to signal fallback to slice path.
         """
+        # 执行 staging 传输：先 gather KV 数据到本地 staging 缓冲区，再通过 RDMA 传输到 decode 端
         try:
             return self.kv_manager.send_kvcache_staged(
                 session_id,
@@ -504,6 +560,8 @@ def init_staging_buffers(engine, kv_args, count: int) -> list:
 
     Returns list of StagingBuffer instances.
     """
+    # 创建 prefill 侧 staging 缓冲区并注册到传输引擎
+    # count 个 StagingBuffer，每个用于一个并发传输 chunk
     from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
     from sglang.srt.disaggregation.mooncake.utils import (
         init_mooncake_custom_mem_pool,
@@ -515,6 +573,7 @@ def init_staging_buffers(engine, kv_args, count: int) -> list:
     gpu_id = kv_args.gpu_id
     device = f"cuda:{gpu_id}"
 
+    # 尝试使用 Mooncake 自定义内存池（NVLink/Barex），失败则退回 cudaMalloc
     _, custom_mem_pool, pool_type = init_mooncake_custom_mem_pool(device)
     if custom_mem_pool is None:
         logger.info(
@@ -525,6 +584,7 @@ def init_staging_buffers(engine, kv_args, count: int) -> list:
 
     buffers = []
     for _ in range(count):
+        # 创建 staging 缓冲区并向引擎注册其物理地址
         buf = StagingBuffer(size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool)
         engine.batch_register([buf.get_ptr()], [buf.get_size()])
         buffers.append(buf)
@@ -536,6 +596,7 @@ def init_staging_allocator(engine, kv_args):
 
     Returns a StagingAllocator instance.
     """
+    # 创建 decode 侧 staging 环形缓冲区分配器并注册到传输引擎
     from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
     from sglang.srt.disaggregation.mooncake.utils import (
         init_mooncake_custom_mem_pool,
@@ -547,8 +608,10 @@ def init_staging_allocator(engine, kv_args):
     gpu_id = kv_args.gpu_id
     device = f"cuda:{gpu_id}"
 
+    # 可选使用自定义内存池以支持 NVLink/MNNVL 传输
     _, custom_mem_pool, _ = init_mooncake_custom_mem_pool(device)
     allocator = StagingAllocator(pool_size_bytes, device, gpu_id, custom_mem_pool)
+    # 向传输引擎注册整个 staging pool 的基址
     engine.batch_register([allocator.get_base_ptr()], [allocator.get_total_size()])
     return allocator
 
@@ -568,6 +631,8 @@ def handle_staging_req(
     Deduplicates: multiple prefill TP ranks requesting the same (room, chunk_idx)
     only allocate once.  Sends ALLOC_OVERSIZED on permanent failure.
     """
+    # 处理 STAGING_REQ 消息：按需分配 staging 空间并发送 STAGING_RSP 响应给 prefill
+    # 幂等处理：同一 (room, chunk_idx) 的多个 prefill TP rank 请求只分配一次
     from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
 
     room = int(msg[1].decode("ascii"))
@@ -595,13 +660,16 @@ def handle_staging_req(
     infos = getattr(receiver, "chunk_staging_infos", [])
 
     if chunk_idx < len(infos) and infos[chunk_idx][0] >= 0:
+        # 已分配过该 chunk，复用已有分配结果
         _, offset, rnd, end, _ = infos[chunk_idx]
     elif (
         chunk_idx < len(infos)
         and infos[chunk_idx][1] == StagingAllocator.ALLOC_OVERSIZED
     ):
+        # 之前分配失败（过大），直接返回 ALLOC_OVERSIZED
         offset, rnd, end = StagingAllocator.ALLOC_OVERSIZED, 0, -1
     else:
+        # 首次分配：计算所需字节数并向 StagingAllocator 申请
         from sglang.srt.disaggregation.common.staging_buffer import (
             compute_staging_layout,
             resolve_total_kv_heads,
@@ -617,6 +685,7 @@ def handle_staging_req(
         dst_tp_rank = kv_args.engine_rank % max(1, attn_tp_size)
 
         chunk_tokens = chunk_num_pages * page_size
+        # 计算该 chunk 所需的 staging 缓冲区字节数
         _, _, required = compute_staging_layout(
             prefill_attn_tp_size,
             attn_tp_size,
@@ -628,6 +697,7 @@ def handle_staging_req(
         )
         result = staging_allocator.assign(required)
         if result is None:
+            # 分配失败（内存不足），记录 ALLOC_OVERSIZED 并提示增加池大小
             logger.error(
                 "[STAGING_REQ] alloc failed room=%s chunk=%d (need %d bytes, "
                 "buffer total=%d bytes). Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB.",
@@ -653,6 +723,7 @@ def handle_staging_req(
                 infos.append((-1, -1, 0, -1, 0))
             infos[chunk_idx] = (alloc_id, offset, rnd, end, chunk_num_pages)
 
+    # 向所有注册的 prefill bootstrap 连接发送 STAGING_RSP
     bootstrap_infos = room_bootstrap.get(room)
     if bootstrap_infos:
         for bi in bootstrap_infos:
@@ -687,6 +758,8 @@ def prefetch_staging_reqs(
     Called from the scheduler right after batch formation, so that decode
     allocates staging during the GPU forward pass.
     """
+    # 在 prefill forward 开始前预先发送所有 chunk 的 STAGING_REQ
+    # 利用 GPU forward pass 的时间让 decode 端并行完成 staging 分配
     import zmq
 
     from sglang.srt.utils.network import NetworkAddress
@@ -701,10 +774,12 @@ def prefetch_staging_reqs(
         total_pages = len(tinfo.dst_kv_indices)
         if total_pages == 0:
             continue
+        # 计算该请求的 chunk 总数
         num_chunks = (total_pages + full_chunk_pages - 1) // full_chunk_pages
 
         for chunk_idx in range(num_chunks):
             stg_key = (room, chunk_idx, session_id)
+            # 去重：已发送过的 STAGING_REQ 不重复发送
             if stg_key in staging_requested:
                 continue
             staging_requested.add(stg_key)
@@ -712,6 +787,7 @@ def prefetch_staging_reqs(
             remaining = total_pages - chunk_idx * full_chunk_pages
             chunk_pages = min(full_chunk_pages, remaining)
             try:
+                # 通过 ZMQ PUSH socket 向 decode 端发送 STAGING_REQ
                 na = NetworkAddress(tinfo.endpoint, tinfo.dst_port)
                 ep = na.to_tcp()
                 if ep not in prefetch_sockets:
@@ -730,4 +806,5 @@ def prefetch_staging_reqs(
                     ]
                 )
             except Exception:
+                # 发送失败时从 staging_requested 中移除，允许重试
                 staging_requested.discard(stg_key)

@@ -12,9 +12,13 @@
 # limitations under the License.
 # ==============================================================================
 """Triton kernels for speculative decoding."""
+# 本模块汇总投机解码所用的 Triton 自定义算子
 
+# 导入融合 KV 物化（materialization）辅助类
+# 该类用于将投机解码产生的草稿 token 的 KV 缓存批量写入显存
 from sglang.srt.speculative.triton_ops.fused_kv_materialize import (
     FusedKVMaterializeHelper,
 )
 
+# 对外暴露的公共接口列表
 __all__ = ["FusedKVMaterializeHelper"]

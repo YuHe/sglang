@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# FlashAttention 后端实现，用于高效的注意力计算
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -8,13 +9,17 @@ import torch
 import triton
 import triton.language as tl
 
+# 导入模型配置中的注意力架构类型
 from sglang.srt.configs.model_config import AttentionArch
+# 导入注意力后端基类
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
+# 导入上下文并行（Context Parallel）的工具函数
 from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
     cp_attn_forward_extend,
 )
+# 导入滑动窗口注意力的 KV 缓存池
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
@@ -25,8 +30,10 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+# 从 sgl_kernel 导入合并注意力状态的工具函数
 from sgl_kernel import merge_state_v2
 
+# 导入 FlashAttention 的核心推理函数
 from sglang.jit_kernel.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
@@ -34,6 +41,7 @@ from sglang.jit_kernel.flash_attention import (
 
 
 @dataclass
+# FlashAttention 元数据类，在模型前向传播中初始化一次，各层可复用
 class FlashAttentionMetadata:
     """Metadata to be init once in the model forward pass,
     each layer's forward pass can reuse the metadata.
@@ -41,36 +49,37 @@ class FlashAttentionMetadata:
     For each init metadata function, we will try set up them in below order
     """
 
-    # Sequence lengths for the forward batch
+    # 当前批次各序列的缓存长度（int32 格式，供 FlashAttention kernel 使用）
     cache_seqlens_int32: torch.Tensor = None
-    # Maximum sequence length for query
+    # query 的最大序列长度
     max_seq_len_q: int = 1
-    # Maximum sequence length for key
+    # key 的最大序列长度
     max_seq_len_k: int = 0
-    # Cumulative sequence lengths for query
+    # query 的累积序列长度（用于 varlen attention）
     cu_seqlens_q: torch.Tensor = None
-    # Cumulative sequence lengths for key
+    # key 的累积序列长度
     cu_seqlens_k: torch.Tensor = None
-    # Window size (typically used by Gemma)
+    # 滑动窗口大小，(-1,-1) 表示无限制（Gemma 模型使用）
     window_size: tuple = (-1, -1)
-    # Page table, the index of KV Cache Tables/Blocks
+    # 页表：KV Cache 的块索引，形状为 [batch, max_pages]
     page_table: torch.Tensor = None
-    # Page table for Sliding Window Attention
+    # 滑动窗口注意力专用的页表
     swa_page_table: torch.Tensor = None
-    # Precomputed FA3 scheduler metadata (avoids per-layer prepare_varlen_num_blocks)
+    # 预计算的 FA3 调度器元数据（避免每层都调用 prepare_varlen_num_blocks）
     scheduler_metadata: torch.Tensor = None
 
-    # Encoder metadata
-    # Cumulative sequence lengths for encoder key
+    # 编码器元数据（用于 encoder-decoder 模型的交叉注意力）
+    # 编码器 key 的累积序列长度
     encoder_cu_seqlens_k: torch.Tensor = None
-    # Maximum sequence length for encoder key
+    # 编码器 key 的最大序列长度
     encoder_max_seq_len_k: int = 0
-    # Sequence lengths for the forward batch
+    # 编码器各序列的实际长度（int32）
     encoder_lens_int32: torch.Tensor = None
-    # Page table for the encoder
+    # 编码器的页表
     encoder_page_table: torch.Tensor = None
 
     @dataclass
+    # 局部注意力元数据子类，用于 chunk-wise 局部注意力计算
     class LocalAttentionMetadata:
         local_query_start_loc: torch.Tensor = None  # cu_seqlens_q for local attention
         local_seqused_k: torch.Tensor = None  # sequence lengths for local attention
@@ -78,9 +87,10 @@ class FlashAttentionMetadata:
         local_max_query_len: int = 0  # max query length for local attention
         local_max_seq_len: int = 0  # max sequence length for local attention
 
+    # 局部注意力元数据，仅在启用局部注意力时有值
     local_attn_metadata: Optional[LocalAttentionMetadata] = None
 
-    # For sliding window attention topk>1 spec decoding
+    # 滑动窗口注意力 + topk>1 投机解码时使用的专用元数据
     swa_spec_metadata: Optional[FlashAttentionMetadata] = None
 
 
@@ -105,35 +115,44 @@ class FlashAttentionBackend(AttentionBackend):
     def __init__(
         self,
         model_runner: ModelRunner,
-        skip_prefill: bool = False,
-        speculative_step_id=0,
-        topk=0,
-        speculative_num_steps=0,
-        fa_impl_ver=3,
+        skip_prefill: bool = False,   # 是否跳过 prefill 阶段（草稿模型可能不需要）
+        speculative_step_id=0,        # 投机解码步骤 ID
+        topk=0,                       # EAGLE 投机解码的 top-k 参数
+        speculative_num_steps=0,      # 投机解码总步骤数
+        fa_impl_ver=3,                # FlashAttention 实现版本（3 或 4）
     ):
         super().__init__()
 
+        # 断言：滑动窗口注意力与交叉注意力不能同时使用
         assert not (
             model_runner.sliding_window_size is not None
             and model_runner.model_config.is_encoder_decoder
         ), "Sliding window and cross attention are not supported together"
 
+        # 是否为 encoder-decoder 模型
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
+        # 当前批次的前向传播元数据
         self.forward_metadata: FlashAttentionMetadata = None
-        # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
+        # 投机解码 topk>1 时的展开元数据
         self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
+        # CUDA 图解码阶段的元数据缓存（按 batch size 索引）
         self.decode_cuda_graph_metadata = {}
         self.target_verify_metadata = {}
+        # 请求到 token 的映射表
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
+        # KV Cache 的分页大小
         self.page_size = model_runner.page_size
+        # 是否使用 MLA（多头潜在注意力，DeepSeek 系列使用）
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
+        # 注意力计算的上下文并行度
         self.attn_cp_size = model_runner.attn_cp_size
 
+        # 是否使用专用的滑动窗口 KV 缓存池
         self.use_sliding_window_kv_pool = (
             isinstance(model_runner.token_to_kv_pool, SWAKVPool)
             and model_runner.token_to_kv_pool.swa_layer_nums > 0
@@ -141,14 +160,16 @@ class FlashAttentionBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool:
             self.token_to_kv_pool = model_runner.token_to_kv_pool
 
+        # EAGLE 投机解码的 top-k 数量
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
+        # 每次投机解码生成的草稿 token 数量
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
         )
         self.speculative_step_id = speculative_step_id
 
-        # Local attention settings
+        # 局部注意力设置（用于如 Llama4 等支持局部注意力的模型）
         self.has_local_attention = model_runner.model_config.is_local_attention_model
         if self.has_local_attention:
             assert (
@@ -156,16 +177,19 @@ class FlashAttentionBackend(AttentionBackend):
             ), "Attention chunk size is required for local attention"
             self.attention_chunk_size = model_runner.attention_chunk_size
 
+        # 滑动窗口大小（各层可能不同，此处存模型级别的值用于元数据准备）
         # For each layer, the sliding_window_size can be different. This is only used for preparing SWA metadata.
         # We use `layer.sliding_window_size` to decide whether to use SWA for each layer.
         self.sliding_window_size = model_runner.sliding_window_size
+        # 是否启用了滑动窗口注意力
         self.has_swa = (
             self.sliding_window_size is not None and self.sliding_window_size > -1
         )
 
-        # Select version
+        # 选择 FlashAttention 实现版本
         self.fa_impl_ver = fa_impl_ver
         if self.fa_impl_ver == 3:
+            # 使用 sgl_kernel 中的 FA3 实现
             from sgl_kernel.flash_attn import (
                 flash_attn_varlen_func,
                 flash_attn_with_kvcache,
@@ -174,6 +198,7 @@ class FlashAttentionBackend(AttentionBackend):
 
             self._get_scheduler_metadata = get_scheduler_metadata
         elif self.fa_impl_ver == 4:
+            # 使用 jit_kernel 中的 FA4 实现
             from sglang.jit_kernel.flash_attention_v4 import (
                 flash_attn_varlen_func,
                 flash_attn_with_kvcache,
@@ -186,20 +211,24 @@ class FlashAttentionBackend(AttentionBackend):
         self.flash_attn_varlen_func = flash_attn_varlen_func
         self.flash_attn_with_kvcache = flash_attn_with_kvcache
 
-        # Store head info for precomputing FA3 scheduler metadata
+        # 存储注意力头信息，用于预计算 FA3 调度器元数据
         self.head_dim = model_runner.model_config.head_dim
+        # 当前 TP 切片下的 query 注意力头数
         self.num_attention_heads = (
             model_runner.model_config.hf_text_config.num_attention_heads
             // model_runner.tp_size
         )
+        # 当前 TP 切片下的 KV 注意力头数
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
             model_runner.tp_size
         )
         _softcapping = getattr(
             model_runner.model_config.hf_text_config, "attn_logit_softcapping", None
         )
+        # 是否启用了注意力 logit softcapping（如 Gemma2 使用）
         self.has_softcap = _softcapping is not None and _softcapping > 0.0
 
+        # num_splits == 0 表示自动选择分割数，设为 1 以保证确定性推理
         # If num_splits == 0, we use a heuristic to automatically determine the number of splits.
         # We set nums splits to 1 if deterministic inference is enabled.
         # See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/ for more details.
@@ -214,6 +243,7 @@ class FlashAttentionBackend(AttentionBackend):
             else 0
         )
 
+        # 在嵌入模式下（无分块 prefill、无 radix cache），跳过 KV cache 写入
         # In embedding mode with no chunked prefill and radix cache disabled,
         # skip KV cache write and use flash_attn_varlen_func with raw K/V
         # instead of flash_attn_with_kvcache, bypassing paged KV cache entirely.
@@ -227,12 +257,14 @@ class FlashAttentionBackend(AttentionBackend):
     def _compute_scheduler_metadata(
         self, batch_size, max_seq_len_k, cache_seqlens, cu_seqlens_q
     ):
-        """Compute FA3 scheduler metadata for decode.
+        """计算 FA3 解码阶段的调度器元数据。
 
         Returns the scheduler_metadata tensor, or None if not applicable.
         """
+        # MLA 模式或无调度器接口时，返回 None
         if self._get_scheduler_metadata is None or self.use_mla:
             return None
+        # 始终使用 window_size=(-1, -1)，因为调度器元数据只被非 SWA 层使用
         # Always use window_size=(-1, -1) because scheduler_metadata is only
         # consumed by non-SWA layers (SWA layers skip it in forward_decode).
         return self._get_scheduler_metadata(
@@ -252,22 +284,25 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Initialize forward metadata hence all layers in the forward pass can reuse it."""
+        """初始化前向传播元数据，使批次中所有层可复用同一份元数据。"""
         metadata = FlashAttentionMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
 
         if forward_batch.forward_mode.is_decode_or_idle():
-            # Draft Decode
+            # 解码阶段（包含草稿解码）
             if forward_batch.spec_info is not None:
+                # 草稿解码（Draft Decode）
                 if self.topk <= 1:
+                    # topk=1 时，使用普通草稿解码元数据
                     metadata.cache_seqlens_int32 = (
                         seqlens_in_batch + (self.speculative_step_id + 1)
                     ).to(torch.int32)
                     metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
                         self.speculative_step_id + 1
                     )
+                    # 每个请求贡献一个 query token，cu_seqlens_q 为等差数列
                     metadata.cu_seqlens_q = torch.arange(
                         0, batch_size + 1, dtype=torch.int32, device=device
                     )
@@ -281,9 +316,11 @@ class FlashAttentionBackend(AttentionBackend):
                         forward_batch.req_pool_indices, : metadata.max_seq_len_k
                     ]
                 else:
+                    # topk>1 时，第一阶段注意力：每个请求有 topk 个 query token
                     metadata.cache_seqlens_int32 = (seqlens_in_batch).to(torch.int32)
                     metadata.max_seq_len_q = self.topk
                     metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                    # cu_seqlens_q 步长为 topk（每个请求 topk 个 query）
                     metadata.cu_seqlens_q = torch.arange(
                         0,
                         batch_size * self.topk + 1,
@@ -300,8 +337,10 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                         forward_batch.req_pool_indices, : metadata.max_seq_len_k
                     ]
+                    # 第二阶段展开元数据：处理草稿 token 部分
                     metadata_expand = FlashAttentionMetadata()
                     decode_length = self.speculative_step_id + 1
+                    # 每个展开 token 对应固定的解码长度
                     metadata_expand.cache_seqlens_int32 = torch.full(
                         (seqlens_in_batch.numel() * self.topk,),
                         decode_length,
@@ -326,14 +365,16 @@ class FlashAttentionBackend(AttentionBackend):
                     cache_loc = forward_batch.out_cache_loc.view(
                         -1, self.speculative_num_steps
                     )
+                    # 取前 decode_length 步的缓存位置作为展开页表
                     metadata_expand.page_table = (
                         cache_loc[:, :decode_length].contiguous().to(torch.int32)
                     )
                     self.forward_metadata_spec_decode_expand = metadata_expand
             else:
-                # Normal Decode
+                # 普通解码（Normal Decode）
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
                 metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                # 普通解码每个请求只有 1 个 query token
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
@@ -343,6 +384,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
+                # 预计算 FA3 调度器元数据，避免每层都重复计算
                 # Precompute FA3 scheduler metadata to avoid per-layer
                 # prepare_varlen_num_blocks kernel calls
                 metadata.scheduler_metadata = self._compute_scheduler_metadata(
@@ -1309,7 +1351,7 @@ class FlashAttentionBackend(AttentionBackend):
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        """Initialize CUDA graph state for the attention backend.
+        """初始化 CUDA 图状态，预分配固定大小的张量以在 CUDA 图回放时复用。
 
         Args:
             max_bs (int): Maximum batch size to support in CUDA graphs
@@ -1317,8 +1359,10 @@ class FlashAttentionBackend(AttentionBackend):
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        # 计算最大序列所需的页面数
         max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
 
+        # 普通解码和 topk==1 草稿解码共用的元数据
         # This is being used by normal decode and draft decode when topk == 1
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
@@ -1338,7 +1382,7 @@ class FlashAttentionBackend(AttentionBackend):
                 0, self.max_context_len, self.page_size, device=self.device
             ),
         }
-        # Pre-allocate scheduler_metadata buffer for CUDA graph
+        # 为 CUDA 图预分配 FA3 调度器元数据缓冲区
         # Size: 1 (semaphore) + round_up(max_bs, 4) * 4 (causal decode vectors)
         if self._get_scheduler_metadata is not None and not self.use_mla:
             b_rounded = ((max_bs + 3) // 4) * 4
@@ -1348,6 +1392,7 @@ class FlashAttentionBackend(AttentionBackend):
         else:
             self._sched_meta_buf = None
 
+        # 仅在启用局部注意力时分配相关缓冲区，避免不必要的内存占用
         # Only allocate local attention buffers if local attention is enabled
         # This prevents OOM errors when local attention is not being used
         if self.has_local_attention:
@@ -1383,6 +1428,7 @@ class FlashAttentionBackend(AttentionBackend):
                 device=self.device,
             )
 
+        # topk>1 草稿解码的第一阶段元数据（前缀 token 部分）
         # This is used by draft decode's first half of metadata when topk > 1
         if self.topk > 1:
             self.draft_decode_metadata_topk_normal = {
@@ -2489,34 +2535,38 @@ class FlashAttentionBackend(AttentionBackend):
 
 
 @triton.jit
+# Triton kernel: 将前缀页表和草稿展开页表按 KV 序列长度拼接，用于 SWA+投机解码
 def _prepare_swa_spec_page_table_kernel(
-    dst_ptr,
-    src_a_ptr,
-    src_b_ptr,
-    seq_len_a_ptr,
-    seq_len_b_ptr,
-    dst_stride_m,
-    dst_stride_n,
-    a_stride_m,
-    a_stride_n,
-    b_stride_m,
-    b_stride_n,
-    LEN_A: tl.constexpr,
-    LEN_B: tl.constexpr,
-    REPEAT_STEP: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    dst_ptr,          # 目标页表指针
+    src_a_ptr,        # 前缀页表（a）指针
+    src_b_ptr,        # 展开页表（b）指针
+    seq_len_a_ptr,    # 前缀序列长度指针
+    seq_len_b_ptr,    # 展开序列长度指针
+    dst_stride_m,     # 目标张量行步长
+    dst_stride_n,     # 目标张量列步长
+    a_stride_m,       # a 张量行步长
+    a_stride_n,       # a 张量列步长
+    b_stride_m,       # b 张量行步长
+    b_stride_n,       # b 张量列步长
+    LEN_A: tl.constexpr,        # a 页表列数（编译期常量）
+    LEN_B: tl.constexpr,        # b 页表列数（编译期常量）
+    REPEAT_STEP: tl.constexpr,  # 每个前缀行对应的展开行数（=投机草稿数）
+    BLOCK_N: tl.constexpr,      # 每个线程块处理的列数
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid_m = tl.program_id(0)  # 行（batch）索引
+    pid_n = tl.program_id(1)  # 列块索引
 
+    # 根据 REPEAT_STEP 找到对应的前缀行索引
     idx_a = pid_m // REPEAT_STEP
     idx_b = pid_m
+    # 加载当前行的序列长度
     seq_len_a = tl.load(seq_len_a_ptr + idx_a)
     seq_len_b = tl.load(seq_len_b_ptr + idx_b)
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     total_len = seq_len_a + seq_len_b
 
+    # 如果当前列块超出总长度，直接返回
     if pid_n * BLOCK_N >= total_len:
         return
 
@@ -2524,17 +2574,20 @@ def _prepare_swa_spec_page_table_kernel(
     dst = dst_ptr + pid_m * dst_stride_m + offs_n * dst_stride_n
 
     if (pid_n + 1) * BLOCK_N < seq_len_a:
+        # 当前块完全在前缀部分，从 a 表加载
         a_ptr = src_a_ptr + idx_a * a_stride_m + offs_n * a_stride_n
         a_mask = mask & (offs_n < LEN_A)
         val = tl.load(a_ptr, mask=a_mask, other=0)
         tl.store(dst, val, mask=mask)
     elif pid_n * BLOCK_N >= seq_len_a:
+        # 当前块完全在展开部分，从 b 表加载
         offs_b = offs_n - seq_len_a
         b_ptr = src_b_ptr + idx_b * b_stride_m + offs_b * b_stride_n
         b_mask = mask & (offs_b < LEN_B)
         val = tl.load(b_ptr, mask=b_mask, other=0)
         tl.store(dst, val, mask=mask)
     else:
+        # 混合部分：跨越 a 和 b 边界，分别加载后合并
         # mixed part
         a_offs = offs_n
         a_mask = (a_offs < seq_len_a) & (a_offs < LEN_A)
@@ -2546,6 +2599,7 @@ def _prepare_swa_spec_page_table_kernel(
         b_ptr = src_b_ptr + idx_b * b_stride_m + b_offs * b_stride_n
         b_val = tl.load(b_ptr, mask=b_mask, other=0)
 
+        # 根据偏移选择来自 a 还是 b 的值
         result = tl.where(offs_n < seq_len_a, a_val, b_val)
         tl.store(dst, result, mask=mask)
 
@@ -2558,6 +2612,7 @@ def prepare_swa_spec_page_table_triton(
     seq_len_b: torch.Tensor,  # expand seq lens
     speculative_num_draft_tokens: int,
 ):
+    # 将普通页表和展开页表按 KV 序列长度合并，供 SWA+投机解码使用
     # concat page_table and expand page_table by kv seq length
     bs = seq_len_a.numel()
     bs_expand = seq_len_b.numel()
@@ -2567,8 +2622,10 @@ def prepare_swa_spec_page_table_triton(
     LEN_B = page_table_b.shape[1]
     LEN_OUT = LEN_A + LEN_B
     REPEAT_STEP = speculative_num_draft_tokens
+    # 每个线程块处理 256 列
     BLOCK_N = 256
 
+    # 按 (展开后 batch 数, 列块数) 启动 grid
     grid = (bs_expand, triton.cdiv(LEN_OUT, BLOCK_N))
     _prepare_swa_spec_page_table_kernel[grid](
         page_table_dst,
@@ -2591,17 +2648,19 @@ def prepare_swa_spec_page_table_triton(
 
 
 class FlashAttentionMultiStepBackend:
+    """多步投机解码的 FlashAttention 后端，管理多个草稿步骤的 attention 实例。"""
 
     def __init__(
         self,
         model_runner: ModelRunner,
-        topk: int,
-        speculative_num_steps: int,
+        topk: int,                    # EAGLE 投机解码的 top-k 数量
+        speculative_num_steps: int,   # 投机解码总步骤数
         fa_impl_ver: int = 3,
     ):
         self.model_runner = model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
+        # 为每个草稿步骤（除最后一步）创建独立的 FlashAttentionBackend 实例
         self.attn_backends = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
@@ -2615,10 +2674,12 @@ class FlashAttentionMultiStepBackend:
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        # 为每个草稿步骤的 backend 分别初始化元数据
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        # 为每个草稿步骤初始化 CUDA 图状态
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
 
@@ -2629,6 +2690,7 @@ class FlashAttentionMultiStepBackend:
         assert forward_batch.spec_info is not None
         assert forward_batch.spec_info.is_draft_input()
 
+        # 为每个草稿步骤捕获 CUDA 图所需的元数据
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
                 forward_batch.batch_size,
@@ -2646,6 +2708,7 @@ class FlashAttentionMultiStepBackend:
         assert forward_batch.spec_info is not None
         assert forward_batch.spec_info.is_draft_input()
 
+        # 为每个草稿步骤更新 CUDA 图回放所需的元数据
         for i in range(self.speculative_num_steps - 1):
             # TODO: incrementally update the metadata for the later steps,
             # so that they do not need to recompute everything from scratch.
@@ -2663,40 +2726,42 @@ class FlashAttentionMultiStepBackend:
 
 
 @triton.jit
+# Triton 通用融合元数据 kernel：同时完成 cache_seqlens 计算、前缀和、以及页表 gather
 def _fused_metadata_kernel_general(
-    # Input tensors
-    seq_lens,
+    # 输入张量
+    seq_lens,                       # 序列长度张量
     seq_lens_stride_0,
-    req_to_token,
+    req_to_token,                   # 请求到 token 的映射表
     req_to_token_stride_0,
     req_to_token_stride_1,
-    req_pool_indices,
+    req_pool_indices,               # 请求池索引
     req_pool_indices_stride_0,
-    # Output buffers
-    cache_seqlens_int32,
+    # 输出缓冲区
+    cache_seqlens_int32,            # 缓存序列长度（int32）
     cache_seqlens_int32_stride_0,
-    cu_seqlens_k,
+    cu_seqlens_k,                   # key 的累积序列长度
     cu_seqlens_k_stride_0,
-    page_table,
+    page_table,                     # 输出页表
     page_table_stride_0,
     page_table_stride_1,
-    swa_page_table,
+    swa_page_table,                 # 滑动窗口注意力页表
     swa_page_table_stride_0,
     swa_page_table_stride_1,
-    full_to_swa_mapping,
+    full_to_swa_mapping,            # 完整 slot 到 SWA slot 的映射
     full_to_swa_mapping_stride_0,
-    # Scalar parameters
-    B,
-    max_seq_pages,
-    page_size: tl.constexpr,
-    seq_len_delta: tl.constexpr,
-    use_swa: tl.constexpr,
-    SHIFT: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
+    # 标量参数
+    B,                              # batch size
+    max_seq_pages,                  # 最大序列页数
+    page_size: tl.constexpr,        # 页大小（编译期常量）
+    seq_len_delta: tl.constexpr,    # 序列长度偏移（草稿解码时 >0）
+    use_swa: tl.constexpr,          # 是否使用滑动窗口注意力
+    SHIFT: tl.constexpr,            # page_size 的 log2（用于位移替代除法）
+    BLOCK_COLS: tl.constexpr,       # 每个列块处理的列数
 ):
-    pid_b = tl.program_id(0)  # batch index
-    pid_c = tl.program_id(1)  # column chunk index
+    pid_b = tl.program_id(0)  # batch index（批次索引）
+    pid_c = tl.program_id(1)  # column chunk index（列块索引）
 
+    # 步骤1：仅第一个线程块（pid_b=0, pid_c=0）串行计算前缀和，更新 cache_seqlens 和 cu_seqlens_k
     # 1. Prefix sum (only one block does it)
     if pid_b == 0 and pid_c == 0:
         acc = 0
@@ -2708,11 +2773,13 @@ def _fused_metadata_kernel_general(
             acc += val
         tl.store(cu_seqlens_k + B * cu_seqlens_k_stride_0, acc)
 
+    # 步骤2：并行 gather 填充当前 batch 和列块的页表
     # 2. Gather for this batch and column chunk
     if max_seq_pages == 0:
         return
 
     i = pid_b
+    # 加载当前 batch 对应的 req_to_token 行索引
     # Load row index for this batch (all threads in block have same i)
     row_idx = tl.load(req_pool_indices + i * req_pool_indices_stride_0)
     row_offset = row_idx * req_to_token_stride_0
@@ -2721,29 +2788,34 @@ def _fused_metadata_kernel_general(
     col_offsets = col_start + tl.arange(0, BLOCK_COLS)
     mask = col_offsets < max_seq_pages
 
+    # 计算在 req_to_token 中的列偏移（page_size>1 时使用位移加速）
     # Compute column indices in the source tensor (token offset)
     if page_size == 1:
         col_idx = col_offsets
     else:
         col_idx = col_offsets << SHIFT  # faster than multiplication for power-of-two
 
+    # 从 req_to_token 中加载页面索引
     # Load page indices from req_to_token
     rt_offsets = row_offset + col_idx * req_to_token_stride_1
     page_index = tl.load(
         req_to_token + rt_offsets, mask=mask, other=0, cache_modifier=".cg"
     )
 
+    # 将 token 索引转换为页面索引（除以 page_size）
     # Compute page_table
     if page_size == 1:
         page_table_val = page_index
     else:
         page_table_val = page_index >> SHIFT
 
+    # 将页面索引写入页表
     # Store to page_table
     pt_offsets = i * page_table_stride_0 + col_offsets * page_table_stride_1
     tl.store(page_table + pt_offsets, page_table_val, mask=mask, cache_modifier=".cg")
 
     if use_swa:
+        # 通过 full→swa 映射表将完整 slot 转换为 SWA slot
         swa_slot = tl.load(
             full_to_swa_mapping + page_index * full_to_swa_mapping_stride_0,
             mask=mask,
@@ -2761,8 +2833,9 @@ def _fused_metadata_kernel_general(
 
 
 @triton.jit
+# Triton 专用融合元数据 kernel：page_size=1 且无 SWA 的快速路径
 def _fused_metadata_kernel_ps1_no_swa(
-    # Input tensors
+    # 输入张量
     seq_lens,
     seq_lens_stride_0,
     req_to_token,
@@ -2770,7 +2843,7 @@ def _fused_metadata_kernel_ps1_no_swa(
     req_to_token_stride_1,
     req_pool_indices,
     req_pool_indices_stride_0,
-    # Output buffers
+    # 输出缓冲区
     cache_seqlens_int32,
     cache_seqlens_int32_stride_0,
     cu_seqlens_k,
@@ -2778,15 +2851,16 @@ def _fused_metadata_kernel_ps1_no_swa(
     page_table,
     page_table_stride_0,
     page_table_stride_1,
-    # Scalar parameters
-    B,
-    max_seq_pages,
-    seq_len_delta: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
+    # 标量参数
+    B,                              # batch size
+    max_seq_pages,                  # 最大序列页数
+    seq_len_delta: tl.constexpr,    # 序列长度偏移
+    BLOCK_COLS: tl.constexpr,       # 每个列块处理的列数
 ):
-    pid_b = tl.program_id(0)  # batch index
-    pid_c = tl.program_id(1)  # column chunk index
+    pid_b = tl.program_id(0)  # batch index（批次索引）
+    pid_c = tl.program_id(1)  # column chunk index（列块索引）
 
+    # 步骤1：串行前缀和（仅第一个线程块执行）
     # 1. Prefix sum (only one block does it)
     if pid_b == 0 and pid_c == 0:
         acc = 0
@@ -2798,11 +2872,13 @@ def _fused_metadata_kernel_ps1_no_swa(
             acc += val
         tl.store(cu_seqlens_k + B * cu_seqlens_k_stride_0, acc)
 
+    # 步骤2：并行 gather 填充页表（page_size=1 时 token 索引即页索引）
     # 2. Gather for this batch and column chunk
     if max_seq_pages == 0:
         return
 
     i = pid_b
+    # 加载当前 batch 对应的 req_to_token 行索引
     # Load row index for this batch (all threads in block have same i)
     row_idx = tl.load(req_pool_indices + i * req_pool_indices_stride_0)
     row_offset = row_idx * req_to_token_stride_0
@@ -2811,12 +2887,14 @@ def _fused_metadata_kernel_ps1_no_swa(
     col_offsets = col_start + tl.arange(0, BLOCK_COLS)
     mask = col_offsets < max_seq_pages
 
+    # page_size = 1: col_idx = col_offsets（无需位移）
     # page_size = 1: col_idx = col_offsets
     rt_offsets = row_offset + col_offsets * req_to_token_stride_1
     page_index = tl.load(
         req_to_token + rt_offsets, mask=mask, other=0, cache_modifier=".cg"
     )
 
+    # page_table = page_index // 1 = page_index（page_size=1 直接赋值）
     # page_table = page_index // 1 = page_index
     pt_offsets = i * page_table_stride_0 + col_offsets * page_table_stride_1
     tl.store(page_table + pt_offsets, page_index, mask=mask, cache_modifier=".cg")
@@ -2838,6 +2916,13 @@ def normal_decode_set_metadata(
     token_to_kv_pool: Optional[SWAKVPool] = None,
 ):
     """
+    融合 Triton 实现：将 4-5 个串行 CUDA kernel 合并为 1-2 个 kernel，包括：
+      1. cache_seqlens = seq_lens + seq_len_delta（int64→int32 强制转换）
+      2. cu_seqlens_k = cumsum(cache_seqlens)（前缀和）
+      3. page_indices = req_to_token[pool_idx, stride_idx]（二维 gather）
+      4. page_table = page_indices // page_size（整除）
+      5. （可选）swa_page_table 用于滑动窗口注意力
+
     Fused Triton implementation that replaces 4-5 sequential CUDA kernels with 1-2 kernels:
       1. cache_seqlens = seq_lens + seq_len_delta (int64→int32 cast)
       2. cu_seqlens_k = cumsum(cache_seqlens) (prefix-sum)
@@ -2847,6 +2932,7 @@ def normal_decode_set_metadata(
 
     Achieves ~5.2x speedup on H200 hardware for typical decode workloads.
     """
+    # page_size 必须是 2 的幂次，确保可用位移替代除法
     assert (
         page_size > 0 and (page_size & (page_size - 1)) == 0
     ), f"page_size must be a power of two, got {page_size}"
@@ -2854,11 +2940,13 @@ def normal_decode_set_metadata(
     batch_size = cache_seqlens_int32.shape[0]
     device = seq_lens.device
 
+    # 确保内存布局连续以提高 Triton 访问效率
     # Ensure contiguous memory layout for efficient Triton access
     seq_lens = seq_lens.contiguous()
     req_to_token = req_to_token.contiguous()
     req_pool_indices = req_pool_indices.contiguous()
 
+    # 准备各张量的步长
     # Prepare tensor strides
     seq_lens_stride_0 = seq_lens.stride(0)
     req_to_token_stride_0 = req_to_token.stride(0)
@@ -2869,10 +2957,12 @@ def normal_decode_set_metadata(
     page_table_stride_0 = page_table.stride(0)
     page_table_stride_1 = page_table.stride(1)
 
+    # 判断是否使用 SWA（滑动窗口注意力）
     # Check if we should use the specialized fast path for page_size=1, no SWA
     use_swa = swa_page_table is not None and token_to_kv_pool is not None
 
     if page_size == 1 and not use_swa:
+        # page_size=1 且无 SWA 时，使用更高效的专用 kernel
         # Specialized kernel for the common case (page_size=1, no SWA)
         BLOCK_COLS = 256
         if max_seq_pages == 0:
@@ -2904,6 +2994,7 @@ def normal_decode_set_metadata(
             num_stages=3,
         )
     else:
+        # 通用 kernel 处理 page_size>1 或 SWA 的情况
         # General kernel for page_size > 1 or SWA cases
         # SWA parameters
         if use_swa:
@@ -2926,6 +3017,7 @@ def normal_decode_set_metadata(
 
         # Kernel configuration
         BLOCK_COLS = 128
+        # 计算 page_size 的 log2 作为位移量（page_size 必须是 2 的幂）
         shift = (page_size).bit_length() - 1 if page_size > 1 else 0
 
         if max_seq_pages == 0:
@@ -2968,24 +3060,29 @@ def normal_decode_set_metadata(
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def draft_decode_set_expand_metadata(
-    cache_seqlens_int32: torch.Tensor,  # Modifies
-    page_table: torch.Tensor,  # Modifies
-    last_page_lens: torch.Tensor,
-    decode_length: int,
-    cache_loc: torch.Tensor,
-    topk: int,
-    page_size: int,
+    cache_seqlens_int32: torch.Tensor,  # 原地修改：展开后的缓存序列长度
+    page_table: torch.Tensor,           # 原地修改：展开后的页表
+    last_page_lens: torch.Tensor,       # 每个请求最后一页的实际 token 数
+    decode_length: int,                 # 当前解码步的长度
+    cache_loc: torch.Tensor,            # 缓存位置 [bs x topk, num_steps]
+    topk: int,                          # EAGLE top-k 数量
+    page_size: int,                     # KV Cache 页大小
 ):
+    # 将 last_page_lens 按 topk 展开，加到缓存序列长度上
     expanded_last_page_lens = last_page_lens.repeat_interleave(topk)
     cache_seqlens_int32.copy_(decode_length + expanded_last_page_lens)
+    # 将 cache_loc 从 token 索引转换为页索引
     cache_loc = (cache_loc // page_size).to(torch.int32)
     if cache_loc.dim() == 1:
         cache_loc = cache_loc.unsqueeze(0)
+    # 向量化去重（torch.unique_consecutive）：找到每行值变化位置后 scatter
     # Vectorized torch.unique_consecutive: track value change points then scatter
     mask = torch.ones_like(cache_loc, dtype=torch.bool)
     mask[:, 1:] = cache_loc[:, 1:] != cache_loc[:, :-1]
+    # 计算去重后的位置索引
     positions = mask.cumsum(dim=1) - 1
     num_seqs = cache_loc.shape[0]
+    # 将唯一页索引 scatter 到 page_table 的正确位置
     page_table[:num_seqs, :].scatter_(1, positions, cache_loc)
 
 
@@ -3051,6 +3148,8 @@ def make_local_attention_virtual_batches(
     page_size: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, torch.Tensor]:
     """
+    将序列拆分为局部注意力块（虚拟 batch），每个局部块作为独立的 batch item 传给注意力 kernel。
+
     Take in `query_start_loc_np` and `seq_lens_np` and break the sequences into
     local attention blocks, where each block is passed to the attention kernel
     as an independent local ("virtual") batch item.
@@ -3068,16 +3167,19 @@ def make_local_attention_virtual_batches(
         seqlens_k_local: Key sequence lengths for local attention
         block_table_local: Block table for local attention
     """
+    # 根据实际序列长度调整 chunk size，防止越界
     # Adjust attention_chunk_size based on the actual sequence length
     # to avoid index out of bounds errors
     max_seq_len = seq_lens_np.max()
     effective_chunk_size = min(attn_chunk_size, max_seq_len)
+    # 确保 effective_chunk_size 是 page_size 的整数倍
     # Make sure effective_chunk_size is divisible by page_size
     effective_chunk_size = (effective_chunk_size // page_size) * page_size
     if effective_chunk_size < page_size:
         effective_chunk_size = page_size
     attn_chunk_size = effective_chunk_size
 
+    # 计算每个序列的 query token 数
     q_seqlens = query_start_loc_np[1:] - query_start_loc_np[:-1]
     actual_batch_size = seq_lens_np.shape[0]
 
@@ -3092,10 +3194,12 @@ def make_local_attention_virtual_batches(
     # Then we would get:
     #   new_tokens_in_first_block = [2, 1, 4]
     #   local_blocks = [2, 4, 2]
+    # 计算第一个局部块中的 query token 数（可能是不完整的块）
     q_tokens_in_first_block = np.minimum(
         attn_chunk_size - ((seq_lens_np - q_seqlens) % attn_chunk_size), q_seqlens
     ).astype(np.int32)
     tokens_in_last_block = attn_chunk_size + (seq_lens_np % -attn_chunk_size)
+    # 计算每个序列需要拆分成的局部块数量
     local_blocks = 1 + cdiv(q_seqlens - q_tokens_in_first_block, attn_chunk_size)
 
     # Once we know the number of local blocks we can compute the request spans
@@ -3106,11 +3210,14 @@ def make_local_attention_virtual_batches(
     #
     # First Get batched arange. (E.g., [2, 4, 2] -> [0, 1, 0, 1, 2, 3, 0, 1])
     #   (TODO: max a utility to share this code with _prepare_inputs)
+    # arange step 1. [2, 4, 2] -> [2, 6, 8]（累积块数）
     # arange step 1. [2, 4, 2] -> [2, 6, 8]
     cu_num_blocks = np.cumsum(local_blocks)
     virtual_batches = cu_num_blocks[-1]
+    # arange step 2. 将块偏移重复展开
     # arange step 2. [2, 6, 8] -> [0, 0, 2, 2, 2, 2, 6, 6]
     block_offsets = np.repeat(cu_num_blocks - local_blocks, local_blocks)
+    # arange step 3. 计算每个虚拟 batch 在其序列内的相对块序号
     # arange step 3. [0, 1, 0, 1, 2, 3, 0, 1]
     arange = np.arange(virtual_batches, dtype=np.int32) - block_offsets
     # also compute reverse arange (i.e. [1, 0, 3, 2, 1, 0, 1, 0])
@@ -3125,6 +3232,7 @@ def make_local_attention_virtual_batches(
         seqlens_q_local - attn_chunk_size * (arange - 1), attn_chunk_size
     )[arange > 0]
 
+    # 将 q_seqlens_local 转换为累积前缀和
     # convert from q_seqlens to cu_seqlens_q
     cu_seqlens_q_local = np.pad(np.cumsum(seqlens_q_local), (1, 0)).astype(np.int32)
 
@@ -3133,6 +3241,7 @@ def make_local_attention_virtual_batches(
     #  batch
     # For our example this will be:
     #   seqlens_k_local = [4, 2, 4, 4, 4, 1, 4, 1]
+    # 每个局部块的 key 长度默认为完整 chunk，最后一块取实际剩余长度
     seqlens_k_local = np.full(cu_num_blocks[-1], attn_chunk_size, dtype=np.int32)
     seqlens_k_local[cu_num_blocks - 1] = tokens_in_last_block
 
@@ -3142,6 +3251,7 @@ def make_local_attention_virtual_batches(
     # For the example the local attention blocks start at:
     #                           _b0_  _____b1_____  _b2_
     #   k_seqstarts_absolute = [0, 4, 4, 8, 12, 16, 4, 8]
+    # 将 key 起始位置转换为页面起始索引
     block_starts = k_seqstarts_absolute // page_size
 
     assert attn_chunk_size % page_size == 0, (
@@ -3168,6 +3278,7 @@ def make_local_attention_virtual_batches(
     #     [ 22, 23 ], < local-batch 6, (batch 2, starting from k[4])
     #     [ 24, 25 ], < local-batch 7, (batch 2, starting from k[8])
     #   ]
+    # 为每个虚拟 batch 构建局部块表，形状 [virtual_batches, pages_per_local_batch]
     block_indices = np.broadcast_to(
         np.arange(pages_per_local_batch, dtype=np.int32),
         (virtual_batches, pages_per_local_batch),
@@ -3176,6 +3287,7 @@ def make_local_attention_virtual_batches(
     # This is a critical safety check that prevents index out of bounds errors
     # when dealing with large sequences (>8192 tokens) or when the block_table
     # dimensions are smaller than what would be needed for the full attention chunk size.
+    # 截断超出 block_table 边界的索引
     block_indices = block_indices.flatten().clip(max=block_table.shape[1] - 1)
     batch_indices = np.repeat(
         np.arange(actual_batch_size, dtype=np.int32),
@@ -3186,6 +3298,7 @@ def make_local_attention_virtual_batches(
     # regression when using numpy arrays (batch and block indices) to index into
     # torch tensor (block_table). As a workaround, convert numpy arrays to torch
     # tensor first, which recovers perf.
+    # 将 numpy 索引转为 torch tensor 以避免性能退化问题
     batch_indices_torch = torch.from_numpy(batch_indices)
     block_indices_torch = torch.from_numpy(block_indices)
     block_table_local = block_table[batch_indices_torch, block_indices_torch].view(
@@ -3196,11 +3309,12 @@ def make_local_attention_virtual_batches(
 
 
 def cdiv(a: int, b: int) -> int:
-    """Ceiling division."""
+    """向上取整除法（ceiling division）。"""
     return -(a // -b)
 
 
 # TODO(hebiao064): remove this once we have a better way to handle the merge_state_v2 torch.compile issue
 @torch._dynamo.disable()
 def merge_state_v2_wrapper(o, s_a, o_exp, s_b):
+    # 包装 merge_state_v2 以禁用 torch.compile 优化（避免编译问题）
     return merge_state_v2(o, s_a, o_exp, s_b)

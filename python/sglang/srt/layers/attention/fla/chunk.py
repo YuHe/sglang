@@ -2,6 +2,9 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+# 本模块实现 Gated Delta Rule 的分块（chunk）前向计算
+# 流程：门控累积和 -> intra-chunk 计算(w/u/A) -> 跨 chunk 状态更新(h) -> 输出计算(o)
+
 from typing import Optional
 
 import torch
@@ -21,26 +24,30 @@ from sglang.srt.layers.attention.fla.utils import (
     input_guard,
 )
 
+# 全局 chunk 大小，控制 FLA 分块粒度
 CHUNK_SIZE = 64
 
 
+# 分块门控 delta rule 前向计算核心流程
 def chunk_gated_delta_rule_fwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    scale: float,
-    initial_state: torch.Tensor,
-    initial_state_indices: torch.Tensor,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    chunk_indices: torch.LongTensor | None = None,
+    q: torch.Tensor,          # query 张量 [B, T, H, K]
+    k: torch.Tensor,          # key 张量 [B, T, H, K]
+    v: torch.Tensor,          # value 张量 [B, T, H, V]
+    g: torch.Tensor,          # 门控张量（对数空间）[B, T, H]
+    beta: torch.Tensor,       # beta 缩放系数 [B, T, H]
+    scale: float,             # 注意力缩放因子
+    initial_state: torch.Tensor,           # 初始递归状态
+    initial_state_indices: torch.Tensor,   # 初始状态索引
+    cu_seqlens: Optional[torch.LongTensor] = None,  # 变长序列累积长度
+    chunk_indices: torch.LongTensor | None = None,  # chunk 索引映射
 ):
+    # 第一步：计算 chunk 内门控的局部前缀累积和（用于指数衰减）
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
     )
 
-    # fused kkt + solve_tril + recompute_w_u
+    # 第二步：fused kkt + solve_tril + recompute_w_u
+    # 计算 intra-chunk 的 w（写权重）、u（更新值）和 A（注意力矩阵）
     w, u, A = chunk_gated_delta_rule_fwd_intra(
         k=k,
         v=v,
@@ -50,6 +57,7 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices,
     )
 
+    # 第三步：利用 w/u 更新跨 chunk 的递归状态 h，并得到修正后的 v_new
     h, v_new = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
@@ -60,6 +68,7 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
+    # 第四步：利用 q、k、v_new、h、g 计算最终输出 o
     o = chunk_fwd_o(
         q=q,
         k=k,
@@ -69,12 +78,14 @@ def chunk_gated_delta_rule_fwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
     )
+    # 根据 SUPPRESS_LEVEL 决定返回中间变量的详细程度
     if SUPPRESS_LEVEL < 3:
         return g, o, A, None, h, None
     elif SUPPRESS_LEVEL >= 3:
         return g, o, A, w, h, v_new
 
 
+# 自定义 autograd Function：封装门控 delta rule 的前向计算
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
 
     @staticmethod
@@ -93,18 +104,22 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
     ):
+        # 保存原始 q/k（用于可能的反向传播）
         q_orig = q
         k_orig = k
 
+        # 可选：在 kernel 内对 q/k 做 L2 归一化
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
             k = l2norm_fwd(k)
 
+        # 预计算变长序列的 chunk 索引映射
         chunk_indices = (
             prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
             if cu_seqlens is not None
             else None
         )
+        # 执行完整的前向计算流程
         g, o, A, w, h, v_new = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
@@ -117,9 +132,11 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
         )
+        # 返回与输入相同精度的输出和最终状态 h
         return o.to(q.dtype), h
 
 
+# 禁用 torch.compile 优化的公共接口函数
 @torch.compiler.disable
 def chunk_gated_delta_rule(
     q: torch.Tensor,
@@ -197,6 +214,7 @@ def chunk_gated_delta_rule(
             cu_seqlens=cu_seqlens
         )
     """
+    # 验证输入数据类型一致性，且不支持 float32
     assert q.dtype == k.dtype == v.dtype
     assert (
         q.dtype != torch.float32
@@ -206,6 +224,7 @@ def chunk_gated_delta_rule(
     ), "beta must be of shape [B, T, H] if head_first=False, or [B, H, T] otherwise."
 
     if head_first:
+        # head-first 格式已弃用，转换为 time-first 格式
         raise DeprecationWarning(
             "head_first is deprecated and will be removed in a future version. "
             "Please use head_first=False for now instead."
@@ -221,11 +240,13 @@ def chunk_gated_delta_rule(
     #         "Please verify your input tensor format matches the expected shape [B, T, H, ...]."
     #     )
     if cu_seqlens is not None:
+        # 变长序列时验证 batch_size 必须为 1
         if q.shape[0] != 1:
             raise ValueError(
                 f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
                 f"Please flatten variable-length inputs before processing."
             )
+        # 验证初始状态数量与序列数一致
         if (
             initial_state_indices is not None
             and initial_state_indices.shape[0] != len(cu_seqlens) - 1
@@ -234,8 +255,10 @@ def chunk_gated_delta_rule(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state_indices.shape[0]}."
             )
+    # 默认缩放因子为 1/sqrt(K)
     if scale is None:
         scale = k.shape[-1] ** -0.5
+    # 调用 autograd Function 执行前向计算
     o, h = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,
@@ -248,6 +271,8 @@ def chunk_gated_delta_rule(
         cu_seqlens,
         use_qk_l2norm_in_kernel,
     )
+    # 如需 head-first 输出，转换输出格式
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
+    # 返回输出 o、None（无梯度流）和最终状态 h
     return o, None, h

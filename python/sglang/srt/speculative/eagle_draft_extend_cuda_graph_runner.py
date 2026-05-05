@@ -11,7 +11,7 @@ from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
     DeepEPCudaGraphRunnerAdapter,
-    LogitsProcessorOutput,
+    LogitsProcessorOutput,      # 从 cuda_graph_runner 重导出，供 replay 输出截取使用
     get_batch_sizes_to_capture,
     get_global_graph_memory_pool,
     model_capture_mode,
@@ -26,6 +26,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftInput
+# fast_topk: 高效 top-k 实现，比 torch.topk 更快（用于草稿 token 选取）
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
     require_attn_tp_gather,
@@ -40,18 +41,20 @@ if TYPE_CHECKING:
 
 @dataclass
 class EagleDraftExtendInputBuffers(ForwardInputBuffers):
-    input_ids: torch.Tensor
-    req_pool_indices: torch.Tensor
-    out_cache_loc: torch.Tensor
-    positions: torch.Tensor
-    mrope_positions: torch.Tensor
-    hidden_states: torch.Tensor
-    seq_lens: torch.Tensor
-    seq_lens_cpu: torch.Tensor
-    extend_seq_lens: torch.Tensor
-    num_accepted_drafts: torch.Tensor
-    num_accepted_tokens: torch.Tensor
-    next_token_logits_buffer: torch.Tensor
+    # EAGLE draft extend 阶段的 CUDA Graph 固定输入缓冲区
+    # extend 阶段：处理验证后剩余的 token（每个请求 speculative_num_steps + 1 个 token）
+    input_ids: torch.Tensor                          # [max_num_token] 输入 token
+    req_pool_indices: torch.Tensor                   # [max_bs] 请求索引
+    out_cache_loc: torch.Tensor                      # [max_num_token] KV slot 位置
+    positions: torch.Tensor                          # [max_num_token] 位置编码
+    mrope_positions: torch.Tensor                    # [3, max_num_token] 多模态 RoPE
+    hidden_states: torch.Tensor                      # [max_num_token, spec_hidden_size] 目标隐状态
+    seq_lens: torch.Tensor                           # [max_bs] 序列长度
+    seq_lens_cpu: torch.Tensor                       # [max_bs] CPU 序列长度
+    extend_seq_lens: torch.Tensor                    # [max_bs] extend 步数（speculative_num_steps+1）
+    num_accepted_drafts: torch.Tensor                # [max_bs] 本轮每请求接受的草稿 token 数
+    num_accepted_tokens: torch.Tensor                # [max_bs] = num_accepted_drafts + 1（含 bonus）
+    next_token_logits_buffer: torch.Tensor           # logits 输出缓冲区（V1: [bs, vocab], V2: [num_tokens, vocab]）
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
@@ -67,11 +70,14 @@ class EAGLEDraftExtendCudaGraphRunner:
         # Parse args
         self.eagle_worker = eagle_worker
         if not hasattr(eagle_worker, "model_runner"):
-            # V2: EagleDraftWorker
+            # V2: EagleDraftWorker（spec-v2 overlap scheduler）
             self.model_runner = model_runner = eagle_worker.draft_runner
+            # DRAFT_EXTEND_V2：所有 token 都输出 logits（用于后续 topk 选取）
             self.forward_mode = ForwardMode.DRAFT_EXTEND_V2
         else:
+            # V1: 标准 EAGLEWorker
             self.model_runner = model_runner = eagle_worker.model_runner
+            # DRAFT_EXTEND：仅最后一个 token 输出 logits（草稿剪枝）
             self.forward_mode = ForwardMode.DRAFT_EXTEND
 
         self.graphs = {}
@@ -100,13 +106,15 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
+        # padded_static_len: 静态 padding 长度（-1 表示未启用，由后端自动确定）
         self.padded_static_len = -1
 
-        # Attention backend
+        # extend 阶段每个请求的 token 数 = speculative_num_steps + 1（所有草稿步 + 1 个新 token）
         self.num_tokens_per_bs = self.speculative_num_steps + 1
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 
+        # 初始化 draft extend 注意力后端的 CUDA Graph 状态
         self.draft_extend_attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
         )
@@ -116,15 +124,17 @@ class EAGLEDraftExtendCudaGraphRunner:
         seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
+        # extend_seq_lens_cpu 固定为 num_tokens_per_bs（每请求相同 extend 长度）
         self.extend_seq_lens_cpu = [self.num_tokens_per_bs] * self.max_bs
 
         if self.enable_torch_compile:
             set_torch_compile_config()
 
-        # Graph inputs
+        # 预分配 CUDA Graph 输入缓冲区
         with torch.device(model_runner.device):
             input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
+            # out_cache_loc 初始化为 1（避免写入 slot 0 产生未定义行为）
             out_cache_loc = torch.ones(
                 (self.max_num_token,), dtype=self._cache_loc_dtype()
             )
@@ -135,6 +145,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                 self.eagle_worker.speculative_algorithm.is_eagle3()
                 and self.eagle_worker.eagle_use_aux_hidden_state
             ):
+                # EAGLE3 + 辅助隐状态：hidden_size 为目标隐状态 * 3（三阶段特征拼接）
                 hidden_states = torch.zeros(
                     (
                         self.max_num_token,
@@ -151,6 +162,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                     dtype=self.model_runner.dtype,
                 )
             else:
+                # 标准 EAGLE：hidden_size = spec_hidden_size
                 hidden_states = torch.zeros(
                     (
                         self.max_num_token,
@@ -158,12 +170,14 @@ class EAGLEDraftExtendCudaGraphRunner:
                     ),
                     dtype=self.model_runner.dtype,
                 )
+            # 重新获取目标模型注意力后端的 fill_value（可能与 extend 后端不同）
             self.seq_len_fill_value = (
                 self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
             )
             seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
+            # extend_seq_lens 和接受数统计初始化为 num_tokens_per_bs（全部接受的默认情况）
             extend_seq_lens = torch.full(
                 (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
             )
@@ -192,6 +206,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                 global_num_tokens_gpu = None
                 global_num_tokens_for_logprob_gpu = None
 
+            # 草稿模型词表大小可能与目标模型不同（llama_eagle 使用 draft_vocab_size）
             if hasattr(
                 self.model_runner.model_config.hf_config, "draft_vocab_size"
             ):  # llama_eagle
@@ -203,6 +218,8 @@ class EAGLEDraftExtendCudaGraphRunner:
             else:
                 vocab_size = self.model_runner.model_config.vocab_size
 
+            # next_token_logits_buffer: V1 模式仅保存最后一个 token 的 logits（bs, vocab）
+            # V2 模式保存所有 token 的 logits（num_tokens, vocab）
             next_token_logits_buffer = torch.zeros(
                 (
                     (
@@ -233,7 +250,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         )
         self.buffers.share_buffers()
 
-        # Capture
+        # 捕获 CUDA Graph（在 model_capture_mode 上下文中执行）
         try:
             with model_capture_mode():
                 self.capture()
@@ -243,6 +260,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             )
 
     def can_run(self, forward_batch: ForwardBatch):
+        # 判断当前 extend batch 是否可以使用 CUDA Graph replay
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -251,6 +269,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
+            # extend 模式用 seq_lens.numel() 而非 batch_size（更精确）
             cuda_graph_bs = forward_batch.seq_lens.numel()
 
         is_bs_supported = (
@@ -271,6 +290,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         return torch.int64
 
     def _capture_init(self, run_once_fn):
+        # 捕获前 warmup 两次
         for _ in range(2):
             torch.cuda.synchronize()
             self.model_runner.tp_group.barrier()
@@ -293,7 +313,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
 
-        # Graph inputs
+        # 切出当前 batch size 对应的缓冲区视图
         input_ids = buffers.input_ids[:num_tokens]
         req_pool_indices = buffers.req_pool_indices[:bs]
         seq_lens = buffers.seq_lens[:bs]
@@ -303,15 +323,17 @@ class EAGLEDraftExtendCudaGraphRunner:
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
         positions = buffers.positions[:num_tokens]
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
+        # hidden_states 每个 token 都有（extend 模式不同于 decode 的只有一个）
         hidden_states = buffers.hidden_states[:num_tokens]
         num_accepted_drafts = buffers.num_accepted_drafts[:bs]
         num_accepted_tokens = buffers.num_accepted_tokens[:bs]
+        # V1 (DRAFT_EXTEND): pruned_states = bs (last token per seq)
+        # V2 (DRAFT_EXTEND_V2): pruned_states = num_tokens (all tokens)
         next_token_logits_buffer = buffers.next_token_logits_buffer[
             : bs if self.forward_mode == ForwardMode.DRAFT_EXTEND else num_tokens
         ]
 
-        # V1 (DRAFT_EXTEND): pruned_states = bs (last token per seq)
-        # V2 (DRAFT_EXTEND_V2): pruned_states = num_tokens (all tokens)
+        # logprob 计算的 token 数量
         num_tokens_for_logprob = (
             num_tokens if self.forward_mode.is_draft_extend_v2() else bs
         )
@@ -351,16 +373,18 @@ class EAGLEDraftExtendCudaGraphRunner:
         else:
             global_dp_buffer_len = None
 
+        # 构造草稿 extend 输入（hidden_states 对应各 token 的目标层特征）
         spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             num_accepted_drafts=num_accepted_drafts,
             num_accepted_tokens=num_accepted_tokens,
         )
+        # positions 在 draft extend 中通过 spec_info 传递（非 forward_batch 顶层字段）
         spec_info.positions = None
 
         self.deepep_adapter.capture(is_extend_in_batch=True)
 
-        # Forward batch
+        # 构造 ForwardBatch（extend 模式：多 token per request）
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
             batch_size=bs,
@@ -384,11 +408,13 @@ class EAGLEDraftExtendCudaGraphRunner:
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
+            # LAST 模式：捕获最后一层的隐状态（草稿模型输入）
             capture_hidden_mode=CaptureHiddenMode.LAST,
             attn_backend=self.draft_extend_attn_backend,
             padded_static_len=self.padded_static_len,
         )
 
+        # 初始化注意力后端的 extend CUDA Graph 捕获元数据
         self.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
             bs=bs,
             num_tokens=num_tokens,
@@ -399,9 +425,9 @@ class EAGLEDraftExtendCudaGraphRunner:
             spec_info=spec_info,
         )
 
-        # Run and capture
+        # 定义单次前向函数（draft extend 阶段直接调用模型 forward）
         def run_once():
-            # Clean intermediate result cache for DP attention
+            # 每次重置 DP 注意力的临时缓存
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(
                 global_dp_buffer_len,
@@ -410,7 +436,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             )
             set_is_extend_in_batch(False)
 
-            # Backup two fields, which will be modified in-place in `draft_forward`.
+            # 备份会被就地修改的字段
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
@@ -419,6 +445,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                 forward_batch.positions,
                 forward_batch,
             )
+            # 对输出 logits 执行 softmax + topk，得到草稿 token 候选
             probs = torch.softmax(ret.next_token_logits, dim=-1)
             ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
 
@@ -442,7 +469,9 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         # batch_size and num_seqs can be different in case there are finished examples
         # in the batch, which will not be counted as num_seqs
+        # raw_bs: 当前实际 batch size（可能小于已捕获的 batch size）
         raw_bs = forward_batch.batch_size
+        # num_tokens: 实际输入 token 数（raw_bs * num_tokens_per_bs 或更少）
         num_tokens = forward_batch.input_ids.shape[0]
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
@@ -456,6 +485,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
 
         bs = self.capture_bs[index]
+        # 若 token 数与 bs * num_tokens_per_bs 不一致（有 padding 或不完整步）
         if bs * self.num_tokens_per_bs != num_tokens:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.out_cache_loc.zero_()
@@ -464,7 +494,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.num_accepted_tokens.fill_(self.num_tokens_per_bs)
             buffers.extend_seq_lens.fill_(self.num_tokens_per_bs)
 
-        # Common inputs
+        # 将真实 batch 数据拷贝到 CUDA Graph 输入缓冲区
         buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
         buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         if forward_batch.extend_seq_lens is not None:
@@ -473,6 +503,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.extend_seq_lens[:raw_bs].fill_(self.num_tokens_per_bs)
         buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
         buffers.positions[:num_tokens].copy_(forward_batch.positions)
+        # 若 hidden_states 维度匹配（非 EAGLE3 aux 模式），直接拷贝
         if (
             forward_batch.spec_info.hidden_states.shape[1]
             == buffers.hidden_states.shape[1]
@@ -505,11 +536,13 @@ class EAGLEDraftExtendCudaGraphRunner:
                 buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
             buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
 
+        # 同步 extend_seq_lens_cpu 列表（供注意力后端 replay 使用）
         if forward_batch.extend_seq_lens_cpu is not None:
             self.extend_seq_lens_cpu[:raw_bs] = forward_batch.extend_seq_lens_cpu
         else:
             self.extend_seq_lens_cpu[:raw_bs] = [self.num_tokens_per_bs] * raw_bs
         if bs > raw_bs:
+            # padding 部分填充默认 extend 长度
             self.extend_seq_lens_cpu[raw_bs:bs] = [self.num_tokens_per_bs] * (
                 bs - raw_bs
             )
@@ -518,6 +551,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         )
         forward_batch.spec_info.extend_seq_lens_tensor = buffers.extend_seq_lens[:bs]
 
+        # 若有 padding，更新 spec_info 中的张量视图
         if bs != raw_bs:
             forward_batch.spec_info.positions = buffers.positions[:num_tokens]
             forward_batch.spec_info.num_accepted_drafts = buffers.num_accepted_drafts[
@@ -527,10 +561,12 @@ class EAGLEDraftExtendCudaGraphRunner:
                 :bs
             ]
 
+        # 更新注意力后端的 extend replay 元数据
         self.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=buffers.req_pool_indices,
             seq_lens=buffers.seq_lens,
+            # seq_lens_sum 加上 padding 请求的虚拟序列长度
             seq_lens_sum=forward_batch.seq_lens_sum
             + (bs - raw_bs) * self.seq_len_fill_value,
             encoder_lens=None,
@@ -539,7 +575,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             seq_lens_cpu=buffers.seq_lens_cpu,
         )
 
-        # Replay
+        # 触发 CUDA Graph replay
         self.raw_bs = raw_bs
         self.bs = bs
         self._replay(forward_batch)
@@ -547,8 +583,10 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
             # DRAFT_EXTEND_V2: all tokens calculations whether accepted or not.
+            # V2 模式：截取到实际 token 数（去掉 padding token 的输出）
             unpadding_bs = num_tokens
         elif bs != raw_bs:
+            # V1 + padding：恢复 spec_info 中的真实 bs 视图
             forward_batch.spec_info.num_accepted_drafts = buffers.num_accepted_drafts[
                 :raw_bs
             ]
@@ -560,6 +598,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             unpadding_bs = None
 
         if unpadding_bs is not None:
+            # 截取输出张量，去除 padding 部分
             out_copy = out
             out = LogitsProcessorOutput(
                 next_token_logits=out.next_token_logits[:unpadding_bs],

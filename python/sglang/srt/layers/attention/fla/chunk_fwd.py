@@ -1,6 +1,9 @@
 # Adapted from https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/gated_delta_rule/chunk_fwd.py
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+# 本模块实现 Gated Delta Rule 的 intra-chunk 前向计算
+# 融合了 KKT 计算、下三角线性方程组求解、w/u 重计算三个步骤
+
 import torch
 import triton
 import triton.language as tl
@@ -15,18 +18,22 @@ from sglang.srt.layers.attention.fla.wy_fast import recompute_w_u_fwd
 
 # TF32 for the block-merge dot products (16x16 matmuls) is safe and ~2x faster on SM90.
 # The numerically sensitive forward-substitution uses scalar ops, not tl.dot.
+# SM90（Hopper）架构上的 block-merge 矩阵乘法可以安全使用 TF32，约快 2 倍
+# 数值敏感的前代换使用标量操作，不用 tl.dot
 if is_tf32_supported:
     _MERGE_DOT_PRECISION = tl.constexpr("tf32")
 else:
     _MERGE_DOT_PRECISION = tl.constexpr("ieee")
 
 
+# 启发式规则：自动检测是否使用门控和变长序列
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
+# autotune：对 BK（key 分块大小）和 warp 数进行调优
 @triton.autotune(
     configs=[
         triton.Config({"BK": BK}, num_warps=num_warps)
@@ -36,23 +43,24 @@ else:
     key=["H", "Hg", "K", "BC"],
     **autotune_cache_kwargs,
 )
+# Triton kernel：融合 KKT + solve_tril，一次 pass 完成 chunk 内注意力矩阵计算和求逆
 @triton.jit(do_not_specialize=["T"])
 def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
-    k,
-    g,
-    beta,
-    A,
-    cu_seqlens,
-    chunk_indices,
-    T,
-    H: tl.constexpr,
-    Hg: tl.constexpr,
-    K: tl.constexpr,
-    BT: tl.constexpr,
-    BC: tl.constexpr,
-    BK: tl.constexpr,
-    USE_G: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    k,           # key 张量指针
+    g,           # 门控累积和指针（可选）
+    beta,        # beta 缩放系数指针
+    A,           # 输出矩阵指针（存储 (I+A)^{-1}）
+    cu_seqlens,  # 变长序列累积长度
+    chunk_indices,  # chunk 索引映射
+    T,           # 序列长度
+    H: tl.constexpr,   # 注意力头数
+    Hg: tl.constexpr,  # key 头数（GQA）
+    K: tl.constexpr,   # key 特征维度
+    BT: tl.constexpr,  # chunk 大小（= 4 * BC）
+    BC: tl.constexpr,  # 子块大小（BT/4，当前固定为 16）
+    BK: tl.constexpr,  # key 分块大小（autotune）
+    USE_G: tl.constexpr,       # 是否使用门控
+    IS_VARLEN: tl.constexpr,   # 是否为变长序列
 ):
     """
     Fused kernel: compute beta * K @ K^T (lower triangular) + solve_tril (I+A)^{-1} in one pass.
@@ -67,10 +75,12 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     4. Block merge to get full (I+A)^{-1}
     5. Write result to A (output)
     """
+    # 获取当前 chunk 和 batch*head 索引
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:
+        # 变长序列：从 chunk_indices 解析样本索引和 chunk 内偏移
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
             chunk_indices + i_t * 2 + 1
         ).to(tl.int32)
@@ -81,24 +91,28 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     else:
         bos, eos = i_b * T, i_b * T + T
 
+    # 如果当前 chunk 超出序列长度，直接返回
     if i_t * BT >= T:
         return
 
+    # 4 个子块的起始行索引（BT = 4 * BC）
     i_tc0 = i_t * BT
     i_tc1 = i_t * BT + BC
     i_tc2 = i_t * BT + 2 * BC
     i_tc3 = i_t * BT + 3 * BC
 
+    # 调整 k 和 A 指针到当前序列的正确起始位置
     k += (bos * Hg + i_h // (H // Hg)) * K
     A += (bos * H + i_h) * BT
 
     o_i = tl.arange(0, BC)
+    # 各子块的有效行掩码（处理序列末尾不足一个 BC 的情况）
     m_tc0 = (i_tc0 + o_i) < T
     m_tc1 = (i_tc1 + o_i) < T
     m_tc2 = (i_tc2 + o_i) < T
     m_tc3 = (i_tc3 + o_i) < T
 
-    # load beta for each sub-chunk
+    # load beta for each sub-chunk 加载 4 个子块的 beta 缩放系数
     p_b0 = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_tc0,), (BC,), (0,))
     p_b1 = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_tc1,), (BC,), (0,))
     p_b2 = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_tc2,), (BC,), (0,))
@@ -108,7 +122,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     b_b2 = tl.load(p_b2, boundary_check=(0,)).to(tl.float32)
     b_b3 = tl.load(p_b3, boundary_check=(0,)).to(tl.float32)
 
-    # load gate if used
+    # load gate if used 加载 4 个子块的门控累积和（用于指数衰减）
     if USE_G:
         p_g0 = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_tc0,), (BC,), (0,))
         p_g1 = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_tc1,), (BC,), (0,))
@@ -122,15 +136,17 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
 
     ############################################################################
     # Step 1: compute all 10 lower-triangular [BC, BC] blocks of K @ K^T
+    # 步骤1：计算 K @ K^T 的所有 10 个下三角 [BC, BC] 子块
+    # 4 个对角块 + 6 个下三角非对角块（共 4+3+2+1=10 块）
     ############################################################################
 
-    # 4 diagonal blocks
+    # 4 diagonal blocks 4 个对角块（每个子块内部的 K*K^T）
     b_A00 = tl.zeros([BC, BC], dtype=tl.float32)
     b_A11 = tl.zeros([BC, BC], dtype=tl.float32)
     b_A22 = tl.zeros([BC, BC], dtype=tl.float32)
     b_A33 = tl.zeros([BC, BC], dtype=tl.float32)
 
-    # 6 off-diagonal blocks
+    # 6 off-diagonal blocks 6 个跨子块的非对角块（子块 i 对子块 j 的注意力，i>j）
     b_A10 = tl.zeros([BC, BC], dtype=tl.float32)
     b_A20 = tl.zeros([BC, BC], dtype=tl.float32)
     b_A21 = tl.zeros([BC, BC], dtype=tl.float32)
@@ -138,12 +154,13 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     b_A31 = tl.zeros([BC, BC], dtype=tl.float32)
     b_A32 = tl.zeros([BC, BC], dtype=tl.float32)
 
+    # 按 K 维度分块累积点积
     for i_k in range(tl.cdiv(K, BK)):
         p_k0 = tl.make_block_ptr(
             k, (T, K), (Hg * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0)
         )
         b_k0 = tl.load(p_k0, boundary_check=(0, 1))
-        # diagonal block 0
+        # diagonal block 0 对角块0：子块0内部的 K*K^T
         b_A00 += tl.dot(b_k0, tl.trans(b_k0))
 
         if i_tc1 < T:
@@ -151,7 +168,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
                 k, (T, K), (Hg * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0)
             )
             b_k1 = tl.load(p_k1, boundary_check=(0, 1))
-            # diagonal block 1
+            # diagonal block 1 对角块1和跨块(1,0)
             b_A11 += tl.dot(b_k1, tl.trans(b_k1))
             # off-diagonal (1,0)
             b_A10 += tl.dot(b_k1, tl.trans(b_k0))
@@ -161,7 +178,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
                     k, (T, K), (Hg * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0)
                 )
                 b_k2 = tl.load(p_k2, boundary_check=(0, 1))
-                # diagonal block 2
+                # diagonal block 2 对角块2和跨块(2,0),(2,1)
                 b_A22 += tl.dot(b_k2, tl.trans(b_k2))
                 # off-diagonal (2,0), (2,1)
                 b_A20 += tl.dot(b_k2, tl.trans(b_k0))
@@ -172,7 +189,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
                         k, (T, K), (Hg * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0)
                     )
                     b_k3 = tl.load(p_k3, boundary_check=(0, 1))
-                    # diagonal block 3
+                    # diagonal block 3 对角块3和跨块(3,0),(3,1),(3,2)
                     b_A33 += tl.dot(b_k3, tl.trans(b_k3))
                     # off-diagonal (3,0), (3,1), (3,2)
                     b_A30 += tl.dot(b_k3, tl.trans(b_k0))
@@ -181,16 +198,17 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
 
     ############################################################################
     # Step 2: apply gate and beta scaling
+    # 步骤2：施加门控衰减和 beta 缩放
     ############################################################################
 
     if USE_G:
-        # diagonal blocks: g_diff = g_i - g_j within sub-chunk
+        # diagonal blocks: g_diff = g_i - g_j within sub-chunk 子块内的时序门控衰减
         b_A00 *= safe_exp(b_g0[:, None] - b_g0[None, :])
         b_A11 *= safe_exp(b_g1[:, None] - b_g1[None, :])
         b_A22 *= safe_exp(b_g2[:, None] - b_g2[None, :])
         b_A33 *= safe_exp(b_g3[:, None] - b_g3[None, :])
 
-        # off-diagonal blocks: g_diff = g_row - g_col (cross sub-chunk)
+        # off-diagonal blocks: g_diff = g_row - g_col (cross sub-chunk) 跨子块的时序门控衰减
         b_A10 *= safe_exp(b_g1[:, None] - b_g0[None, :])
         b_A20 *= safe_exp(b_g2[:, None] - b_g0[None, :])
         b_A21 *= safe_exp(b_g2[:, None] - b_g1[None, :])
@@ -198,11 +216,12 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
         b_A31 *= safe_exp(b_g3[:, None] - b_g1[None, :])
         b_A32 *= safe_exp(b_g3[:, None] - b_g2[None, :])
 
-    # apply beta to row dimension and mask
+    # apply beta to row dimension and mask 构造严格下三角掩码和对角线掩码
     m_d = o_i[:, None] > o_i[None, :]
     m_I = o_i[:, None] == o_i[None, :]
 
     # diagonal blocks: strictly lower triangular within sub-chunk, scaled by beta
+    # 对角块：严格下三角 + beta 缩放（掩掉无效行）
     b_A00 = (
         tl.where(m_d & (m_tc0[:, None] & m_tc0[None, :]), b_A00, 0.0) * b_b0[:, None]
     )
@@ -216,7 +235,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
         tl.where(m_d & (m_tc3[:, None] & m_tc3[None, :]), b_A33, 0.0) * b_b3[:, None]
     )
 
-    # off-diagonal blocks: full block, scaled by beta
+    # off-diagonal blocks: full block, scaled by beta 非对角块：完整块 + beta 缩放
     b_A10 = b_A10 * b_b1[:, None]
     b_A20 = b_A20 * b_b2[:, None]
     b_A21 = b_A21 * b_b2[:, None]
@@ -226,17 +245,21 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
 
     ############################################################################
     # Step 3: forward substitution on diagonal blocks -> (I + A_diag)^{-1}
+    # 步骤3：对各对角块进行前代换，计算 (I + A_diag)^{-1}
     #
     # Same algorithm as solve_tril, but rows are extracted from in-register
     # [BC, BC] tensor via tl.sum(tl.where(mask, tensor, 0), 0) instead of
     # tl.load from HBM.
+    # 算法与 solve_tril 相同，但行从寄存器张量中提取（无 HBM 访问）
     ############################################################################
 
+    # 初始化逆矩阵（从 -A 开始，后续加单位矩阵）
     b_Ai00 = -b_A00
     b_Ai11 = -b_A11
     b_Ai22 = -b_A22
     b_Ai33 = -b_A33
 
+    # 前代换：逐行更新下三角矩阵的逆
     for i in range(2, min(BC, T - i_tc0)):
         b_a00 = tl.sum(tl.where((o_i == i)[:, None], -b_A00, 0.0), 0)
         b_a00 = tl.where(o_i < i, b_a00, 0.0)
@@ -258,6 +281,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
         b_a33 = b_a33 + tl.sum(b_a33[:, None] * b_Ai33, 0)
         b_Ai33 = tl.where((o_i == i)[:, None], b_a33, b_Ai33)
 
+    # 加回单位矩阵（前代换结果中已包含对角线）
     b_Ai00 += m_I
     b_Ai11 += m_I
     b_Ai22 += m_I
@@ -265,8 +289,10 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
 
     ############################################################################
     # Step 4: block merge -> full (I + A)^{-1}
+    # 步骤4：块合并，利用分块矩阵求逆公式计算完整的 (I+A)^{-1}
     ############################################################################
 
+    # 一阶跨块逆：Ai_ij = -Ai_ii @ A_ij @ Ai_jj
     b_Ai10 = -tl.dot(
         tl.dot(b_Ai11, b_A10, input_precision=_MERGE_DOT_PRECISION),
         b_Ai00,
@@ -283,6 +309,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
         input_precision=_MERGE_DOT_PRECISION,
     )
 
+    # 二阶跨块逆：需要利用一阶结果
     b_Ai20 = -tl.dot(
         b_Ai22,
         tl.dot(b_A20, b_Ai00, input_precision=_MERGE_DOT_PRECISION)
@@ -295,6 +322,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
         + tl.dot(b_A32, b_Ai21, input_precision=_MERGE_DOT_PRECISION),
         input_precision=_MERGE_DOT_PRECISION,
     )
+    # 三阶跨块逆
     b_Ai30 = -tl.dot(
         b_Ai33,
         tl.dot(b_A30, b_Ai00, input_precision=_MERGE_DOT_PRECISION)
@@ -305,6 +333,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
 
     ############################################################################
     # Step 5: store full (I + A)^{-1} to output A
+    # 步骤5：将完整的 (I+A)^{-1} 写回输出张量 A（10 个子块）
     ############################################################################
 
     p_A00 = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (i_tc0, 0), (BC, BC), (1, 0))
@@ -324,6 +353,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
         A, (T, BT), (H * BT, 1), (i_tc3, 3 * BC), (BC, BC), (1, 0)
     )
 
+    # 写回所有 10 个子块
     tl.store(p_A00, b_Ai00.to(A.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_A10, b_Ai10.to(A.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_A11, b_Ai11.to(A.dtype.element_ty), boundary_check=(0, 1))
@@ -336,6 +366,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     tl.store(p_A33, b_Ai33.to(A.dtype.element_ty), boundary_check=(0, 1))
 
 
+# Python 封装：执行 GDN intra-chunk 前向计算（融合 kkt + solve_tril + recompute_w_u）
 def chunk_gated_delta_rule_fwd_intra(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -377,16 +408,18 @@ def chunk_gated_delta_rule_fwd_intra(
         u (torch.Tensor): shape `[B, T, H, V]`
         A (torch.Tensor): shape `[B, T, H, BT]`, the solved (I+A)^{-1} matrix
     """
+    # 解析输入形状
     B, T, Hg, K = k.shape
     H = beta.shape[-1]
     BT = chunk_size
-    BC = 16
+    BC = 16  # 子块大小固定为 16（BT = 4 * BC）
 
+    # 预计算 chunk 索引（变长序列）
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    # Step 1: fused kkt + solve_tril
+    # Step 1: fused kkt + solve_tril 第一步：融合 KKT 计算和下三角方程组求解
     A = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
     chunk_gated_delta_rule_fwd_kkt_solve_kernel[(NT, B * H)](
         k=k,
@@ -403,7 +436,7 @@ def chunk_gated_delta_rule_fwd_intra(
         BC=BC,
     )
 
-    # Step 2: recompute_w_u
+    # Step 2: recompute_w_u 第二步：使用 A 重计算 w（写权重）和 u（更新值）
     w, u = recompute_w_u_fwd(
         k=k,
         v=v,
